@@ -101,7 +101,11 @@ void delete_selection(ExpertSelection *&selection) {
   }
 }
 
-#define CUDA_LAUNCH_CHECK() CHECK_CUDA(cudaGetLastError())
+#define CUDA_LAUNCH_CHECK()            \
+  do {                                \
+    CHECK_CUDA(cudaGetLastError());   \
+    CHECK_CUDA(cudaDeviceSynchronize()); \
+  } while (0)
 
 void load_layer_parameters(ShardedSafetensorsLoader *loader, size_t layer_idx) {
   const std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
@@ -398,67 +402,6 @@ void gpt_oss_forward(DeviceTokenBatch *tokens, Tensor *logits) {
   current_tokens = nullptr;
 }
 
-#if 0  // Legacy CPU reference retained for kernel-study notes only.
-void select_next_tokens(DeviceTokenBatch *tokens, Tensor *logits, int32_t *next_tokens) {
-  CHECK_ERROR(logits->dtype == TensorDType::F32,
-              "select_next_tokens expects F32 logits");
-  CHECK_ERROR(logits->ndim == 3 && logits->shape[0] == tokens->B && logits->shape[1] == tokens->T,
-              "select_next_tokens logits shape mismatch");
-
-#pragma omp parallel for
-  for (size_t b = 0; b < tokens->B; ++b) {
-    const int32_t valid = tokens->lengths[b];
-    if (valid <= 0 || (size_t)valid > tokens->T) {
-      next_tokens[b] = 0;
-      continue;
-    }
-
-    const float *row =
-        (const float *)logits->buf + ((b * tokens->T) + (size_t)(valid - 1)) * logits->shape[2];
-    size_t best = 0;
-    float best_value = row[0];
-    for (size_t i = 1; i < logits->shape[2]; ++i) {
-      if (row[i] > best_value) {
-        best_value = row[i];
-        best = i;
-      }
-    }
-    next_tokens[b] = (int32_t)best;
-  }
-}
-#endif
-
-namespace {
-
-__global__ void argmax_last_token_kernel(const float *logits,
-                                         const int32_t *lengths,
-                                         int32_t *next_tokens, size_t B,
-                                         size_t T, size_t vocab_size) {
-  const size_t b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B) {
-    return;
-  }
-
-  const size_t valid = (size_t)lengths[b];
-  if (valid == 0 || valid > T) {
-    next_tokens[b] = 0;
-    return;
-  }
-
-  const float *row = logits + ((b * T) + (valid - 1)) * vocab_size;
-  size_t best = 0;
-  float best_value = row[0];
-  for (size_t i = 1; i < vocab_size; ++i) {
-    if (row[i] > best_value) {
-      best_value = row[i];
-      best = i;
-    }
-  }
-  next_tokens[b] = (int32_t)best;
-}
-
-}  // namespace
-
 void select_next_tokens(DeviceTokenBatch *tokens, Tensor *logits, int32_t *next_tokens) {
   CHECK_ERROR(logits->dtype == TensorDType::F32,
               "select_next_tokens expects F32 logits");
@@ -470,118 +413,26 @@ void select_next_tokens(DeviceTokenBatch *tokens, Tensor *logits, int32_t *next_
   const size_t seq_len = tokens->T;
   const size_t vocab_size = logits->shape[2];
 
-  const dim3 block(kGenerationBlockSize);
-  const dim3 grid((unsigned int)ceil_div(batch_size, (size_t)block.x));
-  argmax_last_token_kernel<<<grid, block>>>(
-      logit_buf, length_buf, next_token_buf, batch_size, seq_len, vocab_size);
+  // TODO: replace with a host-side reference loop using the buffers above.
+  // for (size_t b = 0; b < batch_size; ++b) {
+  //   const size_t valid = (size_t)length_buf[b];
+  //   if (valid == 0 || valid > seq_len) {
+  //     next_token_buf[b] = 0;
+  //     continue;
+  //   }
+  //   const float *row = logit_buf + ((b * seq_len) + (valid - 1)) * vocab_size;
+  //   size_t best = 0;
+  //   float best_value = row[0];
+  //   for (size_t i = 1; i < vocab_size; ++i) {
+  //     if (row[i] > best_value) {
+  //       best_value = row[i];
+  //       best = i;
+  //     }
+  //   }
+  //   next_token_buf[b] = (int32_t)best;
+  // }
   CUDA_LAUNCH_CHECK();
 }
-
-#if 0  // Legacy CPU reference retained for kernel-study notes only.
-void append_next_tokens(DeviceTokenBatch *tokens, const int32_t *next_tokens,
-                        int32_t *generated_tokens, int32_t *generated_lengths,
-                        uint8_t *finished, size_t max_new_tokens) {
-  auto is_eos_host = [&](int32_t token_id) {
-    for (size_t i = 0; i < eos_token_count; ++i) {
-      if (token_id == eos_token_ids_gpu[i]) {
-        return true;
-      }
-    }
-    return false;
-  };
-
-#pragma omp parallel for
-  for (size_t b = 0; b < tokens->B; ++b) {
-    if (finished[b] != 0) {
-      continue;
-    }
-
-    const int32_t next = next_tokens[b];
-    if (is_eos_host(next)) {
-      finished[b] = 1;
-      continue;
-    }
-
-    const int32_t generated_len = generated_lengths[b];
-    if ((size_t)generated_len < max_new_tokens) {
-      generated_tokens[b * max_new_tokens + (size_t)generated_len] = next;
-      generated_lengths[b] = generated_len + 1;
-    }
-
-    int32_t valid = tokens->lengths[b];
-    if (valid < 0) {
-      valid = 0;
-    }
-    if ((size_t)valid < tokens->T) {
-      tokens->buf[b * tokens->T + (size_t)valid] = next;
-      tokens->lengths[b] = valid + 1;
-      continue;
-    }
-
-    for (size_t t = 1; t < tokens->T; ++t) {
-      tokens->buf[b * tokens->T + (t - 1)] = tokens->buf[b * tokens->T + t];
-    }
-    tokens->buf[b * tokens->T + (tokens->T - 1)] = next;
-    tokens->lengths[b] = (int32_t)tokens->T;
-  }
-}
-#endif
-
-namespace {
-
-__device__ bool is_eos_device(int32_t token_id, const int32_t *eos_ids,
-                              size_t eos_count) {
-  for (size_t i = 0; i < eos_count; ++i) {
-    if (token_id == eos_ids[i]) {
-      return true;
-    }
-  }
-  return false;
-}
-
-__global__ void append_next_tokens_kernel(
-    const int32_t *next_tokens, const int32_t *eos_ids, int32_t *window_tokens,
-    int32_t *window_lengths, int32_t *generated_tokens,
-    int32_t *generated_lengths, uint8_t *finished, size_t T,
-    size_t max_new_tokens, size_t eos_count, size_t B) {
-  const size_t b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B) {
-    return;
-  }
-  if (finished[b] != 0) {
-    return;
-  }
-
-  const int32_t next = next_tokens[b];
-  if (is_eos_device(next, eos_ids, eos_count)) {
-    finished[b] = 1;
-    return;
-  }
-
-  int32_t generated_len = generated_lengths[b];
-  if ((size_t)generated_len < max_new_tokens) {
-    generated_tokens[b * max_new_tokens + (size_t)generated_len] = next;
-    generated_lengths[b] = generated_len + 1;
-  }
-
-  int32_t valid = window_lengths[b];
-  if (valid < 0) {
-    valid = 0;
-  }
-  if ((size_t)valid < T) {
-    window_tokens[b * T + (size_t)valid] = next;
-    window_lengths[b] = valid + 1;
-    return;
-  }
-
-  for (size_t t = 1; t < T; ++t) {
-    window_tokens[b * T + (t - 1)] = window_tokens[b * T + t];
-  }
-  window_tokens[b * T + (T - 1)] = next;
-  window_lengths[b] = (int32_t)T;
-}
-
-}  // namespace
 
 void append_next_tokens(DeviceTokenBatch *tokens, const int32_t *next_tokens,
                         int32_t *generated_tokens, int32_t *generated_lengths,
@@ -597,12 +448,43 @@ void append_next_tokens(DeviceTokenBatch *tokens, const int32_t *next_tokens,
   const size_t eos_count = eos_token_count;
   const size_t batch_size = tokens->B;
 
-  const dim3 block(kGenerationBlockSize);
-  const dim3 grid((unsigned int)ceil_div(batch_size, (size_t)block.x));
-  append_next_tokens_kernel<<<grid, block>>>(
-      next_token_buf, eos_buf, token_buf, length_buf, generated_token_buf,
-      generated_length_buf, finished_buf, seq_len, max_new_tokens, eos_count,
-      batch_size);
+  // TODO: replace with a host-side reference loop using the buffers above.
+  // for (size_t b = 0; b < batch_size; ++b) {
+  //   if (finished_buf[b] != 0) {
+  //     continue;
+  //   }
+  //   const int32_t next = next_token_buf[b];
+  //   bool is_eos = false;
+  //   for (size_t i = 0; i < eos_count; ++i) {
+  //     if (next == eos_buf[i]) {
+  //       is_eos = true;
+  //       break;
+  //     }
+  //   }
+  //   if (is_eos) {
+  //     finished_buf[b] = 1;
+  //     continue;
+  //   }
+  //   const int32_t generated_len = generated_length_buf[b];
+  //   if ((size_t)generated_len < max_new_tokens) {
+  //     generated_token_buf[b * max_new_tokens + (size_t)generated_len] = next;
+  //     generated_length_buf[b] = generated_len + 1;
+  //   }
+  //   int32_t valid = length_buf[b];
+  //   if (valid < 0) {
+  //     valid = 0;
+  //   }
+  //   if ((size_t)valid < seq_len) {
+  //     token_buf[b * seq_len + (size_t)valid] = next;
+  //     length_buf[b] = valid + 1;
+  //     continue;
+  //   }
+  //   for (size_t t = 1; t < seq_len; ++t) {
+  //     token_buf[b * seq_len + (t - 1)] = token_buf[b * seq_len + t];
+  //   }
+  //   token_buf[b * seq_len + (seq_len - 1)] = next;
+  //   length_buf[b] = (int32_t)seq_len;
+  // }
   CUDA_LAUNCH_CHECK();
 }
 
