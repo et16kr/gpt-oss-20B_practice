@@ -9,7 +9,6 @@ struct CliOptions {
   std::string logits_output_path;
   int context_len = 0;
   int max_new_tokens = 64;
-  bool run_validation = false;
   bool run_warmup = false;
   bool cuda_profiler_range = false;
   bool help = false;

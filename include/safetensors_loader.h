@@ -15,14 +15,22 @@ struct QuantizedExpertMatrix {
   size_t groups = 0;
   size_t bytes_per_block = 16;
   TensorDType bias_dtype = TensorDType::F32;
-  std::vector<uint8_t> blocks;
-  std::vector<uint8_t> scales;
-  std::vector<uint8_t> bias_bytes;
-  std::vector<float> bias;
+  size_t blocks_bytes = 0;
+  size_t scales_bytes = 0;
+  size_t bias_bytes = 0;
+  uint8_t *blocks = nullptr;
+  uint8_t *scales = nullptr;
+  void *bias = nullptr;
 
-  const uint8_t *row_blocks(size_t expert_idx, size_t row_idx) const;
-  const uint8_t *row_scales(size_t expert_idx, size_t row_idx) const;
-  float row_bias(size_t expert_idx, size_t row_idx) const;
+  QuantizedExpertMatrix() = default;
+  ~QuantizedExpertMatrix();
+
+  QuantizedExpertMatrix(const QuantizedExpertMatrix &) = delete;
+  QuantizedExpertMatrix &operator=(const QuantizedExpertMatrix &) = delete;
+  QuantizedExpertMatrix(QuantizedExpertMatrix &&other) noexcept;
+  QuantizedExpertMatrix &operator=(QuantizedExpertMatrix &&other) noexcept;
+
+  void free_gpu();
 };
 
 class ShardedSafetensorsLoader {

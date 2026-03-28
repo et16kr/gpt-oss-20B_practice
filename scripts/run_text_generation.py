@@ -30,7 +30,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--main-binary", type=Path, default=PROJECT_ROOT / "main")
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--context-len", type=int, default=0)
-    parser.add_argument("--validate", action="store_true")
     parser.add_argument("--warmup", action="store_true")
     parser.add_argument("--cuda-profiler-range", action="store_true")
     parser.add_argument("--keep-temp", action="store_true")
@@ -174,8 +173,6 @@ def run_main(args: argparse.Namespace, prompt_tokens: Path, output_tokens: Path)
     ]
     if args.context_len > 0:
         cmd.extend(["--context-len", str(args.context_len)])
-    if args.validate:
-        cmd.append("--validate")
     if args.warmup:
         cmd.append("--warmup")
     if args.cuda_profiler_range:

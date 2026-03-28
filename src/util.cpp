@@ -56,15 +56,15 @@ int validate_buffer(const float *output, const float *answer, size_t n,
   return -1;
 }
 
-void print_last_token_topk(const Tensor *logits, size_t batch_size,
-                           size_t seq_len, int k) {
+void print_last_token_topk(const float *logits, size_t batch_size, size_t seq_len,
+                           size_t vocab_size, int k) {
   CHECK_ERROR(k > 0, "k must be positive");
   const size_t row = (batch_size - 1) * seq_len + (seq_len - 1);
-  const float *ptr = logits->buf + row * logits->shape[2];
+  const float *ptr = logits + row * vocab_size;
 
   std::vector<std::pair<float, int>> top;
-  top.reserve(logits->shape[2]);
-  for (size_t i = 0; i < logits->shape[2]; ++i) {
+  top.reserve(vocab_size);
+  for (size_t i = 0; i < vocab_size; ++i) {
     top.push_back({ptr[i], (int)i});
   }
 

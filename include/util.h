@@ -24,5 +24,5 @@ void *read_binary(const char *filename, size_t *size);
 void write_binary(const char *filename, const void *buf, size_t size);
 int validate_buffer(const float *output, const float *answer, size_t n,
                     float atol, float rtol);
-void print_last_token_topk(const Tensor *logits, size_t batch_size,
-                           size_t seq_len, int k);
+void print_last_token_topk(const float *logits, size_t batch_size, size_t seq_len,
+                           size_t vocab_size, int k);

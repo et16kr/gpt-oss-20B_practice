@@ -33,8 +33,6 @@ CliOptions parse_args(int argc, char **argv) {
     } else if (arg == "-n" || arg == "--max-new-tokens") {
       options.max_new_tokens =
           std::stoi(require_value(argc, argv, &index, "--max-new-tokens"));
-    } else if (arg == "-v" || arg == "--validate") {
-      options.run_validation = true;
     } else if (arg == "-w" || arg == "--warmup") {
       options.run_warmup = true;
     } else if (arg == "--cuda-profiler-range") {
@@ -58,7 +56,6 @@ void print_help(const CliOptions &defaults) {
   printf("      --token-output PATH    Generated token batch output\n");
   printf("  -c, --context-len N        Context window used during generation\n");
   printf("  -n, --max-new-tokens N     Greedy generation length (default: 64)\n");
-  printf("  -v, --validate             Compare forward output against CPU reference\n");
   printf("  -w, --warmup               Warm up once before generation\n");
   printf("      --cuda-profiler-range  Wrap timed inference with cudaProfilerStart/Stop\n\n");
   printf("Forward-only mode:\n");

@@ -48,44 +48,25 @@ std::vector<std::vector<int>> batch_to_sequences(const TokenBatch &batch,
   return sequences;
 }
 
-TokenBatch make_padded_batch(const std::vector<std::vector<int>> &sequences,
-                             size_t context_len, int pad_token_id) {
+TokenBatch make_context_window_batch(const std::vector<std::vector<int>> &sequences,
+                                     size_t context_len, int pad_token_id) {
   CHECK_ERROR(!sequences.empty(), "sequences must not be empty");
 
   const size_t batch_size = sequences.size();
-  size_t max_len = 0;
-  for (const std::vector<int> &sequence : sequences) {
-    const size_t used = std::min(sequence.size(), context_len);
-    CHECK_ERROR(used > 0, "each sequence must contain at least one token");
-    max_len = std::max(max_len, used);
-  }
-
-  TokenBatch batch(batch_size, max_len);
+  TokenBatch batch(batch_size, context_len);
   for (size_t i = 0; i < batch.n_elem; ++i) {
     batch.buf[i] = pad_token_id;
   }
   for (size_t b = 0; b < batch_size; ++b) {
     const size_t used = std::min(sequences[b].size(), context_len);
+    CHECK_ERROR(used > 0, "each sequence must contain at least one token");
     const size_t start = sequences[b].size() - used;
     batch.lengths[b] = (int32_t)used;
     for (size_t t = 0; t < used; ++t) {
-      batch.buf[b * max_len + t] = sequences[b][start + t];
+      batch.buf[b * context_len + t] = sequences[b][start + t];
     }
   }
   return batch;
-}
-
-int argmax_last_token(const Tensor &logits, size_t batch_idx, size_t seq_len,
-                      size_t valid_len, size_t vocab_size) {
-  const float *row =
-      logits.buf + ((batch_idx * seq_len) + (valid_len - 1)) * vocab_size;
-  size_t best = 0;
-  for (size_t i = 1; i < vocab_size; ++i) {
-    if (row[i] > row[best]) {
-      best = i;
-    }
-  }
-  return (int)best;
 }
 
 void maybe_warmup_batch(const CliOptions &options,
@@ -95,10 +76,13 @@ void maybe_warmup_batch(const CliOptions &options,
     return;
   }
 
-  TokenBatch batch = make_padded_batch(sequences, context_len, pad_token_id);
+  TokenBatch batch = make_context_window_batch(sequences, context_len, pad_token_id);
+  DeviceTokenBatch device_batch(batch.B, batch.T);
+  device_batch.upload(batch);
   alloc_activations(batch.B, batch.T);
   Tensor logits({batch.B, batch.T, model_config().vocab_size});
-  gpt_oss_forward(&batch, &logits);
+  gpt_oss_forward(&device_batch, &logits);
+  CHECK_CUDA(cudaDeviceSynchronize());
   *did_warmup = true;
 }
 
@@ -147,6 +131,30 @@ void write_token_sequences(const char *path, const std::vector<std::vector<int>>
   CHECK_ERROR(output.good(), "failed to write generated token file %s", path);
 }
 
+std::vector<std::vector<int>> download_generated_sequences(const int32_t *generated_tokens,
+                                                           const int32_t *generated_lengths,
+                                                           size_t batch_size,
+                                                           size_t max_new_tokens) {
+  std::vector<int32_t> host_lengths(batch_size, 0);
+  std::vector<int32_t> host_tokens(batch_size * max_new_tokens, 0);
+  CHECK_CUDA(cudaMemcpy(host_lengths.data(), generated_lengths,
+                        batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost));
+  if (max_new_tokens > 0) {
+    CHECK_CUDA(cudaMemcpy(host_tokens.data(), generated_tokens,
+                          batch_size * max_new_tokens * sizeof(int32_t),
+                          cudaMemcpyDeviceToHost));
+  }
+
+  std::vector<std::vector<int>> sequences(batch_size);
+  for (size_t b = 0; b < batch_size; ++b) {
+    CHECK_ERROR(host_lengths[b] >= 0 && (size_t)host_lengths[b] <= max_new_tokens,
+                "Invalid generated length for batch row %zu", b);
+    sequences[b].assign(host_tokens.begin() + (ptrdiff_t)(b * max_new_tokens),
+                        host_tokens.begin() + (ptrdiff_t)(b * max_new_tokens + host_lengths[b]));
+  }
+  return sequences;
+}
+
 }  // namespace
 
 void run_generation_mode(const CliOptions &options) {
@@ -155,55 +163,51 @@ void run_generation_mode(const CliOptions &options) {
   const int pad_token_id = pick_pad_token(model_config());
 
   std::vector<std::vector<int>> sequences = batch_to_sequences(prompts, context_len);
-  std::vector<std::vector<int>> completions(sequences.size());
-  std::vector<bool> finished(sequences.size(), false);
   bool did_warmup = false;
-
   maybe_warmup_batch(options, sequences, context_len, pad_token_id, &did_warmup);
-  maybe_start_cuda_profiler_range(options);
 
+  TokenBatch initial_window = make_context_window_batch(sequences, context_len, pad_token_id);
+  DeviceTokenBatch device_window(initial_window.B, initial_window.T);
+  device_window.upload(initial_window);
+
+  alloc_activations(device_window.B, device_window.T);
+  Tensor logits({device_window.B, device_window.T, model_config().vocab_size});
+
+  int32_t *next_tokens = nullptr;
+  int32_t *generated_tokens = nullptr;
+  int32_t *generated_lengths = nullptr;
+  uint8_t *finished = nullptr;
+  CHECK_CUDA(cudaMalloc((void **)&next_tokens, device_window.B * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc((void **)&generated_lengths, device_window.B * sizeof(int32_t)));
+  CHECK_CUDA(cudaMalloc((void **)&finished, device_window.B * sizeof(uint8_t)));
+  CHECK_CUDA(cudaMemset(next_tokens, 0, device_window.B * sizeof(int32_t)));
+  CHECK_CUDA(cudaMemset(generated_lengths, 0, device_window.B * sizeof(int32_t)));
+  CHECK_CUDA(cudaMemset(finished, 0, device_window.B * sizeof(uint8_t)));
+  if (options.max_new_tokens > 0) {
+    CHECK_CUDA(cudaMalloc((void **)&generated_tokens,
+                          device_window.B * (size_t)options.max_new_tokens *
+                              sizeof(int32_t)));
+    CHECK_CUDA(cudaMemset(generated_tokens, 0,
+                          device_window.B * (size_t)options.max_new_tokens *
+                              sizeof(int32_t)));
+  }
+
+  maybe_start_cuda_profiler_range(options);
   double total_elapsed = 0.0;
   for (int step = 0; step < options.max_new_tokens; ++step) {
-    bool all_finished = true;
-    for (bool done : finished) {
-      if (!done) {
-        all_finished = false;
-        break;
-      }
-    }
-    if (all_finished) {
-      break;
-    }
-
-    TokenBatch batch = make_padded_batch(sequences, context_len, pad_token_id);
-    alloc_activations(batch.B, batch.T);
-    Tensor logits({batch.B, batch.T, model_config().vocab_size});
-
     const double st = get_time();
-    gpt_oss_forward(&batch, &logits);
+    gpt_oss_forward(&device_window, &logits);
+    select_next_tokens(&device_window, &logits, next_tokens);
+    append_next_tokens(&device_window, next_tokens, generated_tokens, generated_lengths,
+                       finished, (size_t)options.max_new_tokens);
+    CHECK_CUDA(cudaDeviceSynchronize());
     const double et = get_time();
     total_elapsed += et - st;
-
-    if (options.run_validation) {
-      validate_against_cpu(&batch, &logits);
-    }
-
-    for (size_t b = 0; b < batch.B; ++b) {
-      if (finished[b]) {
-        continue;
-      }
-      const int next_token =
-          argmax_last_token(logits, b, batch.T, (size_t)batch.lengths[b],
-                            model_config().vocab_size);
-      if (model_config().is_eos(next_token)) {
-        finished[b] = true;
-        continue;
-      }
-      completions[b].push_back(next_token);
-      sequences[b].push_back(next_token);
-    }
   }
   maybe_stop_cuda_profiler_range(options);
+
+  std::vector<std::vector<int>> completions = download_generated_sequences(
+      generated_tokens, generated_lengths, device_window.B, (size_t)options.max_new_tokens);
 
   size_t generated = 0;
   for (const std::vector<int> &tokens : completions) {
@@ -215,6 +219,13 @@ void run_generation_mode(const CliOptions &options) {
   }
 
   write_token_sequences(options.token_output_path.c_str(), completions, pad_token_id);
+
+  CHECK_CUDA(cudaFree(next_tokens));
+  CHECK_CUDA(cudaFree(generated_lengths));
+  CHECK_CUDA(cudaFree(finished));
+  if (generated_tokens != nullptr) {
+    CHECK_CUDA(cudaFree(generated_tokens));
+  }
 }
 
 void run_forward_only_mode(const CliOptions &options) {
@@ -224,32 +235,36 @@ void run_forward_only_mode(const CliOptions &options) {
   printf(" Token input      : %s\n", options.token_input_path.c_str());
   printf(" Model dir        : %s\n", options.model_dir.c_str());
   printf(" Logits output    : %s\n", options.logits_output_path.c_str());
-  printf(" Validation       : %s\n", options.run_validation ? "ON" : "OFF");
   printf(" Warm-up          : %s\n", options.run_warmup ? "ON" : "OFF");
   printf("=============================================\n\n");
 
-  TokenBatch tokens = load_tokens(options.token_input_path.c_str());
-  alloc_activations(tokens.B, tokens.T);
-  Tensor logits({tokens.B, tokens.T, model_config().vocab_size});
+  TokenBatch host_tokens = load_tokens(options.token_input_path.c_str());
+  DeviceTokenBatch device_tokens(host_tokens.B, host_tokens.T);
+  device_tokens.upload(host_tokens);
+  alloc_activations(device_tokens.B, device_tokens.T);
+  Tensor logits({device_tokens.B, device_tokens.T, model_config().vocab_size});
 
   if (options.run_warmup) {
-    gpt_oss_forward(&tokens, &logits);
+    gpt_oss_forward(&device_tokens, &logits);
+    CHECK_CUDA(cudaDeviceSynchronize());
   }
 
   maybe_start_cuda_profiler_range(options);
   const double st = get_time();
-  gpt_oss_forward(&tokens, &logits);
+  gpt_oss_forward(&device_tokens, &logits);
+  CHECK_CUDA(cudaDeviceSynchronize());
   const double et = get_time();
   maybe_stop_cuda_profiler_range(options);
 
   printf("Elapsed time: %.6f sec\n", et - st);
-  printf("Throughput  : %.3f tokens/sec\n", (double)(tokens.B * tokens.T) / (et - st));
+  printf("Throughput  : %.3f tokens/sec\n",
+         (double)(device_tokens.B * device_tokens.T) / (et - st));
 
-  print_last_token_topk(&logits, tokens.B, tokens.T, 5);
-  write_binary(options.logits_output_path.c_str(), logits.buf,
-               logits.num_elem() * sizeof(float));
-
-  if (options.run_validation) {
-    validate_against_cpu(&tokens, &logits);
-  }
+  std::vector<float> host_logits(logits.num_elem(), 0.0f);
+  CHECK_CUDA(cudaMemcpy(host_logits.data(), logits.buf, logits.num_bytes(),
+                        cudaMemcpyDeviceToHost));
+  print_last_token_topk(host_logits.data(), device_tokens.B, device_tokens.T,
+                        logits.shape[2], 5);
+  write_binary(options.logits_output_path.c_str(), host_logits.data(),
+               host_logits.size() * sizeof(float));
 }

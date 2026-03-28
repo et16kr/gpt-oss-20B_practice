@@ -1,17 +1,19 @@
 #include "safetensors_loader.h"
 
 #include <cstdint>
-#include <cstring>
 #include <fstream>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
 #include "util.h"
 
 namespace {
+
 ShardedSafetensorsLoader::TensorInfo parse_tensor_info(const nlohmann::json &tensor) {
   ShardedSafetensorsLoader::TensorInfo info;
   info.dtype = tensor.at("dtype").get<std::string>();
@@ -24,19 +26,87 @@ ShardedSafetensorsLoader::TensorInfo parse_tensor_info(const nlohmann::json &ten
   return info;
 }
 
+void free_device(void *ptr) {
+  if (ptr != nullptr) {
+    CHECK_CUDA(cudaFree(ptr));
+  }
+}
+
 }  // namespace
 
-const uint8_t *QuantizedExpertMatrix::row_blocks(size_t expert_idx, size_t row_idx) const {
-  const size_t row_size = groups * bytes_per_block;
-  return blocks.data() + ((expert_idx * out_dim) + row_idx) * row_size;
+QuantizedExpertMatrix::~QuantizedExpertMatrix() { free_gpu(); }
+
+QuantizedExpertMatrix::QuantizedExpertMatrix(QuantizedExpertMatrix &&other) noexcept {
+  num_experts = other.num_experts;
+  out_dim = other.out_dim;
+  in_dim = other.in_dim;
+  groups = other.groups;
+  bytes_per_block = other.bytes_per_block;
+  bias_dtype = other.bias_dtype;
+  blocks_bytes = other.blocks_bytes;
+  scales_bytes = other.scales_bytes;
+  bias_bytes = other.bias_bytes;
+  blocks = other.blocks;
+  scales = other.scales;
+  bias = other.bias;
+
+  other.num_experts = 0;
+  other.out_dim = 0;
+  other.in_dim = 0;
+  other.groups = 0;
+  other.bytes_per_block = 16;
+  other.blocks_bytes = 0;
+  other.scales_bytes = 0;
+  other.bias_bytes = 0;
+  other.blocks = nullptr;
+  other.scales = nullptr;
+  other.bias = nullptr;
 }
 
-const uint8_t *QuantizedExpertMatrix::row_scales(size_t expert_idx, size_t row_idx) const {
-  return scales.data() + ((expert_idx * out_dim) + row_idx) * groups;
+QuantizedExpertMatrix &QuantizedExpertMatrix::operator=(QuantizedExpertMatrix &&other) noexcept {
+  if (this == &other) {
+    return *this;
+  }
+
+  free_gpu();
+
+  num_experts = other.num_experts;
+  out_dim = other.out_dim;
+  in_dim = other.in_dim;
+  groups = other.groups;
+  bytes_per_block = other.bytes_per_block;
+  bias_dtype = other.bias_dtype;
+  blocks_bytes = other.blocks_bytes;
+  scales_bytes = other.scales_bytes;
+  bias_bytes = other.bias_bytes;
+  blocks = other.blocks;
+  scales = other.scales;
+  bias = other.bias;
+
+  other.num_experts = 0;
+  other.out_dim = 0;
+  other.in_dim = 0;
+  other.groups = 0;
+  other.bytes_per_block = 16;
+  other.blocks_bytes = 0;
+  other.scales_bytes = 0;
+  other.bias_bytes = 0;
+  other.blocks = nullptr;
+  other.scales = nullptr;
+  other.bias = nullptr;
+  return *this;
 }
 
-float QuantizedExpertMatrix::row_bias(size_t expert_idx, size_t row_idx) const {
-  return bias[(expert_idx * out_dim) + row_idx];
+void QuantizedExpertMatrix::free_gpu() {
+  free_device(blocks);
+  free_device(scales);
+  free_device(bias);
+  blocks = nullptr;
+  scales = nullptr;
+  bias = nullptr;
+  blocks_bytes = 0;
+  scales_bytes = 0;
+  bias_bytes = 0;
 }
 
 ShardedSafetensorsLoader::ShardedSafetensorsLoader(const char *model_dir)
@@ -140,10 +210,10 @@ Parameter *ShardedSafetensorsLoader::load_parameter(
   Parameter *param = new Parameter(expected_shape, dtype);
   const size_t bytes = numel * tensor_dtype_size(dtype);
   CHECK_ERROR((info.end - info.begin) == bytes, "Tensor %s byte size mismatch", name);
-  read_bytes(*file_info, info, param->storage, bytes);
-  if (tensor_dtype_has_fp32_staging(dtype)) {
-    param->sync_fp32_from_storage();
-  }
+
+  std::vector<uint8_t> scratch(bytes);
+  read_bytes(*file_info, info, scratch.data(), bytes);
+  CHECK_CUDA(cudaMemcpy(param->buf, scratch.data(), bytes, cudaMemcpyHostToDevice));
   return param;
 }
 
@@ -184,50 +254,25 @@ QuantizedExpertMatrix ShardedSafetensorsLoader::load_quantized_expert_matrix(
   matrix.groups = blocks_info.shape[2];
   matrix.bytes_per_block = blocks_info.shape[3];
   matrix.bias_dtype = tensor_dtype_from_safetensors(bias_info.dtype);
-  matrix.blocks.resize(num_experts * out_dim * matrix.groups * matrix.bytes_per_block);
-  matrix.scales.resize(num_experts * out_dim * matrix.groups);
-  matrix.bias_bytes.resize(num_experts * out_dim * tensor_dtype_size(matrix.bias_dtype));
-  matrix.bias.resize(num_experts * out_dim);
+  matrix.blocks_bytes = num_experts * out_dim * matrix.groups * matrix.bytes_per_block;
+  matrix.scales_bytes = num_experts * out_dim * matrix.groups;
+  matrix.bias_bytes = num_experts * out_dim * tensor_dtype_size(matrix.bias_dtype);
 
-  read_bytes(*blocks_file, blocks_info, matrix.blocks.data(), matrix.blocks.size());
-  read_bytes(*scales_file, scales_info, matrix.scales.data(), matrix.scales.size());
+  std::vector<uint8_t> host_blocks(matrix.blocks_bytes);
+  std::vector<uint8_t> host_scales(matrix.scales_bytes);
+  std::vector<uint8_t> host_bias(matrix.bias_bytes);
+  read_bytes(*blocks_file, blocks_info, host_blocks.data(), host_blocks.size());
+  read_bytes(*scales_file, scales_info, host_scales.data(), host_scales.size());
+  read_bytes(*bias_file, bias_info, host_bias.data(), host_bias.size());
 
-  size_t bias_numel = num_experts * out_dim;
-  read_bytes(*bias_file, bias_info, matrix.bias_bytes.data(), matrix.bias_bytes.size());
-  if (matrix.bias_dtype == TensorDType::F32) {
-    memcpy(matrix.bias.data(), matrix.bias_bytes.data(), bias_numel * sizeof(float));
-  } else {
-    const uint16_t *raw = (const uint16_t *)matrix.bias_bytes.data();
-    for (size_t i = 0; i < bias_numel; ++i) {
-      if (matrix.bias_dtype == TensorDType::BF16) {
-        const uint32_t bits = (uint32_t)raw[i] << 16;
-        memcpy(&matrix.bias[i], &bits, sizeof(float));
-      } else {
-        const uint32_t sign = (uint32_t)(raw[i] & 0x8000) << 16;
-        const uint32_t exp = (raw[i] >> 10) & 0x1f;
-        const uint32_t mant = raw[i] & 0x03ff;
-        uint32_t bits = 0;
-        if (exp == 0) {
-          if (mant == 0) {
-            bits = sign;
-          } else {
-            int e = -14;
-            uint32_t m = mant;
-            while ((m & 0x0400) == 0) {
-              m <<= 1;
-              --e;
-            }
-            m &= 0x03ff;
-            bits = sign | (uint32_t)(e + 127) << 23 | (m << 13);
-          }
-        } else if (exp == 0x1f) {
-          bits = sign | 0x7f800000 | (mant << 13);
-        } else {
-          bits = sign | ((exp + (127 - 15)) << 23) | (mant << 13);
-        }
-        memcpy(&matrix.bias[i], &bits, sizeof(float));
-      }
-    }
-  }
+  CHECK_CUDA(cudaMalloc((void **)&matrix.blocks, matrix.blocks_bytes));
+  CHECK_CUDA(cudaMalloc((void **)&matrix.scales, matrix.scales_bytes));
+  CHECK_CUDA(cudaMalloc((void **)&matrix.bias, matrix.bias_bytes));
+  CHECK_CUDA(cudaMemcpy(matrix.blocks, host_blocks.data(), matrix.blocks_bytes,
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(matrix.scales, host_scales.data(), matrix.scales_bytes,
+                        cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy(matrix.bias, host_bias.data(), matrix.bias_bytes,
+                        cudaMemcpyHostToDevice));
   return matrix;
 }

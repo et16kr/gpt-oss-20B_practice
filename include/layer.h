@@ -4,7 +4,7 @@
 #include "tensor.h"
 
 void EmbeddingLookup(TokenBatch *tokens, Tensor *embedding, Tensor *output);
-void EmbeddingLookup_gpu_i32xbf16_to_bf16(TokenBatch *tokens, Tensor *embedding,
+void EmbeddingLookup_gpu_i32xbf16_to_bf16(DeviceTokenBatch *tokens, Tensor *embedding,
                                           Tensor *output);
 
 void RMSNorm(Tensor *input, Tensor *weight, Tensor *output, float eps);
@@ -41,7 +41,7 @@ void AttentionScoresWithSink_gpu_bf16xbf16xbf16_to_f32(Tensor *q, Tensor *k,
 void ScaleMaskSoftmax(Tensor *scores, Tensor *probs, size_t head_dim,
                       const TokenBatch *tokens, size_t sliding_window);
 void ScaleMaskSoftmax_gpu_f32_to_f32(Tensor *scores, Tensor *probs,
-                                     size_t head_dim, const TokenBatch *tokens,
+                                     size_t head_dim, const DeviceTokenBatch *tokens,
                                      size_t sliding_window);
 
 void AttentionContextGrouped(Tensor *probs, Tensor *v, Tensor *context);

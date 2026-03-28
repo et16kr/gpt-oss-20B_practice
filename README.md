@@ -2,9 +2,10 @@
 
 CUDA 커널 연습용 `gpt-oss-20b` inference 프로젝트입니다.
 
-- CPU reference forward/generation을 먼저 제공합니다.
-- 각 연산은 `*_gpu()` 경계를 가지고 있으며, 현재는 CPU fallback으로 동작합니다.
-- 목표는 학생이 커널을 하나씩 교체해 가며 `gpt-oss-20b` 추론 경로를 직접 완성하는 것입니다.
+- active runtime은 GPU-only 경로입니다.
+- weight는 checkpoint의 native dtype(BF16, MXFP4/U8)를 변환 없이 device에 올립니다.
+- legacy CPU reference는 소스 안에 `#if 0` 블록으로 남겨 두고, build/runtime에서는 제외합니다.
+- 목표는 학생이 `*_gpu_*` 경계를 따라 커널을 하나씩 교체해 가며 `gpt-oss-20b` 추론 경로를 직접 완성하는 것입니다.
 
 ## 기준 모델
 
@@ -28,7 +29,7 @@ CUDA 커널 연습용 `gpt-oss-20b` inference 프로젝트입니다.
 
 - root checkpoint `images/gpt-oss-20b/` 지원
 - sharded safetensors 로딩
-- BF16 일반 weight 로딩
+- BF16 일반 weight raw 로딩
 - MXFP4 expert weight raw 로딩 및 on-the-fly dot product
 - GQA + YaRN RoPE + sliding/full attention + sink attention
 - top-4 MoE + interleaved SwiGLU
@@ -103,6 +104,7 @@ Hugging Face 비교:
 
 ## 주의
 
-- 이 저장소는 학습용 CPU reference 중심이라 느립니다.
+- 이 저장소는 학습용 custom CUDA kernel 경로라 빠르지 않을 수 있습니다.
+- C++ binary 내부 CPU validation은 제거했고, 정답 비교는 Hugging Face `transformers` 스크립트 기준으로만 지원합니다.
 - 공용 환경 `../.venv`에 `transformers`, `torch`, `numpy`, `accelerate`, `kernels`가 설치되어 있어야 Python wrapper/HF 비교 스크립트를 실행할 수 있습니다.
-- `*_gpu()`는 현재 CPU fallback이며, 이후 커널 구현용 자리입니다.
+- legacy CPU reference는 build/runtime에서 비활성화되어 있으며, 읽기 전용 참고 자료로만 남아 있습니다.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import subprocess
 import tempfile
 from pathlib import Path
@@ -313,26 +314,46 @@ def main() -> int:
         import numpy as np
         global torch
         import torch
+        from transformers import AutoConfig
     except ImportError as exc:
         raise RuntimeError("numpy is required for compare_hf_logits.py") from exc
-    tokenizer, model, device = load_hf_model(args.model_dir, args)
+
     sequences, pad_token_id = load_or_build_sequences(args)
     lengths = [len(seq) for seq in sequences]
+    cpp_logits = None
+    cpp_generated = None
 
     if args.mode in ("logits", "both"):
-        cpp_logits = run_cpp_logits(args.main_binary, args.model_dir, sequences, pad_token_id, model.config.vocab_size)
+        config = AutoConfig.from_pretrained(
+            str(args.model_dir),
+            local_files_only=True,
+            trust_remote_code=True,
+        )
+        cpp_logits = run_cpp_logits(
+            args.main_binary, args.model_dir, sequences, pad_token_id, config.vocab_size
+        )
+
+    if args.mode in ("generation", "both"):
+        cpp_generated = run_cpp_generation(
+            args.main_binary, args.model_dir, sequences, pad_token_id, args.max_new_tokens
+        )
+
+    tokenizer, model, device = load_hf_model(args.model_dir, args)
+
+    if args.mode in ("logits", "both"):
         hf_logits = run_hf_logits(model, device, sequences, pad_token_id)
         if cpp_logits.shape != hf_logits.shape:
             raise ValueError(f"logits shape mismatch: cpp={cpp_logits.shape}, hf={hf_logits.shape}")
         compare_logits(tokenizer, cpp_logits, hf_logits, lengths, args.top_k)
 
     if args.mode in ("generation", "both"):
-        cpp_generated = run_cpp_generation(
-            args.main_binary, args.model_dir, sequences, pad_token_id, args.max_new_tokens
-        )
         hf_generated = run_hf_generation(model, device, sequences, pad_token_id, args.max_new_tokens)
         compare_generation(cpp_generated, hf_generated)
 
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return 0
 
 
