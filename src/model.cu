@@ -1,5 +1,7 @@
 #include "model.h"
 
+#include <cuda_bf16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
@@ -9,20 +11,20 @@
 #include <utility>
 #include <vector>
 
-#include "cuda_common.h"
 #include "layer.h"
 #include "safetensors_loader.h"
 #include "util.h"
 
 namespace {
 
-constexpr TensorDType kResidualActivationDType = TensorDType::F32;
+constexpr TensorDType kResidualActivationDType = TensorDType::BF16;
 constexpr TensorDType kAttentionActivationDType = TensorDType::BF16;
 constexpr TensorDType kRouterActivationDType = TensorDType::BF16;
 constexpr TensorDType kMoeIntermediateDType = TensorDType::BF16;
 constexpr TensorDType kAttentionAccumDType = TensorDType::F32;
-constexpr int kMoeBlockSize = 128;
 constexpr int kGenerationBlockSize = 256;
+
+inline size_t ceil_div(size_t n, size_t d) { return (n + d - 1) / d; }
 
 Activation *make_activation(const std::vector<size_t> &shape, TensorDType dtype) {
   return new Activation(shape, dtype);
@@ -100,311 +102,6 @@ void delete_selection(ExpertSelection *&selection) {
 }
 
 #define CUDA_LAUNCH_CHECK() CHECK_CUDA(cudaGetLastError())
-
-__device__ inline float fp4_value(uint8_t code) {
-  switch (code & 0x0F) {
-    case 0x0:
-      return +0.0f;
-    case 0x1:
-      return +0.5f;
-    case 0x2:
-      return +1.0f;
-    case 0x3:
-      return +1.5f;
-    case 0x4:
-      return +2.0f;
-    case 0x5:
-      return +3.0f;
-    case 0x6:
-      return +4.0f;
-    case 0x7:
-      return +6.0f;
-    case 0x8:
-      return -0.0f;
-    case 0x9:
-      return -0.5f;
-    case 0xA:
-      return -1.0f;
-    case 0xB:
-      return -1.5f;
-    case 0xC:
-      return -2.0f;
-    case 0xD:
-      return -3.0f;
-    case 0xE:
-      return -4.0f;
-    default:
-      return -6.0f;
-  }
-}
-
-__global__ void expert_gate_up_kernel(const void *input, TensorDType input_dtype,
-                                      const int32_t *lengths,
-                                      const int32_t *selection_indices,
-                                      const uint8_t *blocks, const uint8_t *scales,
-                                      const void *bias, TensorDType bias_dtype,
-                                      void *output, TensorDType output_dtype,
-                                      size_t B, size_t T,
-                                      size_t hidden, size_t K, size_t out_dim,
-                                      size_t num_experts, size_t groups,
-                                      size_t bytes_per_block, size_t input_elems,
-                                      size_t blocks_bytes, size_t scales_elems,
-                                      size_t bias_elems) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * T * K * out_dim;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t row = tmp % out_dim;
-  tmp /= out_dim;
-  const size_t k_idx = tmp % K;
-  tmp /= K;
-  const size_t t = tmp % T;
-  const size_t b = tmp / T;
-
-  if (lengths != nullptr && t >= (size_t)lengths[b]) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-
-  const size_t expert_idx = (size_t)selection_indices[(b * T + t) * K + k_idx];
-  if (expert_idx >= num_experts) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-  const size_t row_offset = expert_idx * out_dim + row;
-  if (row_offset >= bias_elems) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-  float sum = cuda_common::load_tensor_value(bias, bias_dtype, row_offset);
-  const size_t values_per_group = bytes_per_block * 2;
-  const size_t input_base = (b * T + t) * hidden;
-  for (size_t g = 0; g < groups; ++g) {
-    const size_t scale_index = row_offset * groups + g;
-    if (scale_index >= scales_elems) {
-      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-      return;
-    }
-    const size_t block_offset = scale_index * bytes_per_block;
-    if (block_offset + bytes_per_block > blocks_bytes) {
-      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-      return;
-    }
-    const int exponent = (int)scales[scale_index] - 127;
-    const uint8_t *group_blocks = blocks + block_offset;
-    const size_t base = g * values_per_group;
-    for (size_t i = 0; i < bytes_per_block; ++i) {
-      const size_t lo_index = input_base + base + 2 * i;
-      const size_t hi_index = lo_index + 1;
-      if (hi_index >= input_elems) {
-        cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-        return;
-      }
-      const uint8_t value = group_blocks[i];
-      const float lo = ldexpf(fp4_value(value & 0x0F), exponent);
-      const float hi = ldexpf(fp4_value((value >> 4) & 0x0F), exponent);
-      sum = fmaf(lo, cuda_common::load_tensor_value(input, input_dtype, lo_index),
-                 sum);
-      sum = fmaf(hi, cuda_common::load_tensor_value(input, input_dtype, hi_index),
-                 sum);
-    }
-  }
-  cuda_common::store_tensor_value(output, output_dtype, idx, sum);
-}
-
-__global__ void expert_down_kernel(const void *input, TensorDType input_dtype,
-                                   const int32_t *lengths,
-                                   const int32_t *selection_indices,
-                                   const uint8_t *blocks, const uint8_t *scales,
-                                   const void *bias, TensorDType bias_dtype,
-                                   void *output, TensorDType output_dtype,
-                                   size_t B, size_t T,
-                                   size_t K, size_t in_dim, size_t out_dim,
-                                   size_t num_experts, size_t groups,
-                                   size_t bytes_per_block, size_t input_elems,
-                                   size_t blocks_bytes, size_t scales_elems,
-                                   size_t bias_elems) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * T * K * out_dim;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t row = tmp % out_dim;
-  tmp /= out_dim;
-  const size_t k_idx = tmp % K;
-  tmp /= K;
-  const size_t t = tmp % T;
-  const size_t b = tmp / T;
-
-  if (lengths != nullptr && t >= (size_t)lengths[b]) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-
-  const size_t expert_idx = (size_t)selection_indices[(b * T + t) * K + k_idx];
-  if (expert_idx >= num_experts) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-  const size_t row_offset = expert_idx * out_dim + row;
-  if (row_offset >= bias_elems) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-  float sum = cuda_common::load_tensor_value(bias, bias_dtype, row_offset);
-  const size_t values_per_group = bytes_per_block * 2;
-  const size_t input_base = ((b * T + t) * K + k_idx) * in_dim;
-  for (size_t g = 0; g < groups; ++g) {
-    const size_t scale_index = row_offset * groups + g;
-    if (scale_index >= scales_elems) {
-      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-      return;
-    }
-    const size_t block_offset = scale_index * bytes_per_block;
-    if (block_offset + bytes_per_block > blocks_bytes) {
-      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-      return;
-    }
-    const int exponent = (int)scales[scale_index] - 127;
-    const uint8_t *group_blocks = blocks + block_offset;
-    const size_t base = g * values_per_group;
-    for (size_t i = 0; i < bytes_per_block; ++i) {
-      const size_t lo_index = input_base + base + 2 * i;
-      const size_t hi_index = lo_index + 1;
-      if (hi_index >= input_elems) {
-        cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-        return;
-      }
-      const uint8_t value = group_blocks[i];
-      const float lo = ldexpf(fp4_value(value & 0x0F), exponent);
-      const float hi = ldexpf(fp4_value((value >> 4) & 0x0F), exponent);
-      sum = fmaf(lo, cuda_common::load_tensor_value(input, input_dtype, lo_index),
-                 sum);
-      sum = fmaf(hi, cuda_common::load_tensor_value(input, input_dtype, hi_index),
-                 sum);
-    }
-  }
-  cuda_common::store_tensor_value(output, output_dtype, idx, sum);
-}
-
-__global__ void weighted_expert_reduce_kernel(const void *expert_outputs,
-                                              TensorDType expert_output_dtype,
-                                              const int32_t *lengths,
-                                              const float *selection_weights,
-                                              void *output,
-                                              TensorDType output_dtype, size_t B,
-                                              size_t T, size_t K,
-                                              size_t hidden) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * T * hidden;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t h = tmp % hidden;
-  tmp /= hidden;
-  const size_t t = tmp % T;
-  const size_t b = tmp / T;
-
-  if (lengths != nullptr && t >= (size_t)lengths[b]) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-
-  float sum = 0.0f;
-  for (size_t k_idx = 0; k_idx < K; ++k_idx) {
-    const float weight = selection_weights[(b * T + t) * K + k_idx];
-    const size_t src =
-        (((b * T + t) * K + k_idx) * hidden) + h;
-    sum = fmaf(weight,
-               cuda_common::load_tensor_value(expert_outputs,
-                                              expert_output_dtype, src),
-               sum);
-  }
-  cuda_common::store_tensor_value(output, output_dtype, idx, sum);
-}
-
-__global__ void argmax_last_token_kernel(const float *logits, const int32_t *lengths,
-                                         int32_t *next_tokens, size_t B, size_t T,
-                                         size_t vocab_size) {
-  const size_t b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B) {
-    return;
-  }
-
-  const size_t valid = (size_t)lengths[b];
-  if (valid == 0 || valid > T) {
-    next_tokens[b] = 0;
-    return;
-  }
-
-  const float *row = logits + ((b * T) + (valid - 1)) * vocab_size;
-  size_t best = 0;
-  float best_value = row[0];
-  for (size_t i = 1; i < vocab_size; ++i) {
-    if (row[i] > best_value) {
-      best_value = row[i];
-      best = i;
-    }
-  }
-  next_tokens[b] = (int32_t)best;
-}
-
-__device__ bool is_eos_device(int32_t token_id, const int32_t *eos_ids, size_t eos_count) {
-  for (size_t i = 0; i < eos_count; ++i) {
-    if (token_id == eos_ids[i]) {
-      return true;
-    }
-  }
-  return false;
-}
-
-__global__ void append_next_tokens_kernel(
-    int32_t *window_tokens, int32_t *window_lengths, size_t T, const int32_t *next_tokens,
-    int32_t *generated_tokens, int32_t *generated_lengths, uint8_t *finished,
-    size_t max_new_tokens, const int32_t *eos_ids, size_t eos_count, size_t B) {
-  const size_t b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B) {
-    return;
-  }
-  if (finished[b] != 0) {
-    return;
-  }
-
-  const int32_t next = next_tokens[b];
-  if (is_eos_device(next, eos_ids, eos_count)) {
-    finished[b] = 1;
-    return;
-  }
-
-  int32_t generated_len = generated_lengths[b];
-  if ((size_t)generated_len < max_new_tokens) {
-    generated_tokens[b * max_new_tokens + (size_t)generated_len] = next;
-    generated_lengths[b] = generated_len + 1;
-  }
-
-  int32_t valid = window_lengths[b];
-  if (valid < 0) {
-    valid = 0;
-  }
-  if ((size_t)valid < T) {
-    window_tokens[b * T + (size_t)valid] = next;
-    window_lengths[b] = valid + 1;
-    return;
-  }
-
-  for (size_t t = 1; t < T; ++t) {
-    window_tokens[b * T + (t - 1)] = window_tokens[b * T + t];
-  }
-  window_tokens[b * T + (T - 1)] = next;
-  window_lengths[b] = (int32_t)T;
-}
 
 void load_layer_parameters(ShardedSafetensorsLoader *loader, size_t layer_idx) {
   const std::string prefix = "model.layers." + std::to_string(layer_idx) + ".";
@@ -520,139 +217,42 @@ void free_parameters() {
   eos_token_count = 0;
 }
 
-#if 0  // Legacy CPU reference retained for kernel-study notes only.
-inline float dot_quantized_row(const QuantizedExpertMatrix &matrix, size_t expert_idx,
-                               size_t row_idx, const float *input) {
-  return 0.0f;
-}
+void transformer_block(size_t layer_idx) {
+  RMSNorm(x, input_norm_weight[layer_idx], norm_buf, config_.rms_norm_eps);
 
-void ExpertGateUp(Tensor *input, const ExpertSelection *selection, size_t layer_idx,
-                  Tensor *output) {
-}
-#endif
+  LinearBias(norm_buf, q_proj_weight[layer_idx], q_proj_bias[layer_idx], q_proj);
+  LinearBias(norm_buf, k_proj_weight[layer_idx], k_proj_bias[layer_idx], k_proj);
+  LinearBias(norm_buf, v_proj_weight[layer_idx], v_proj_bias[layer_idx], v_proj);
 
-void ExpertGateUp_gpu(Tensor *input, const ExpertSelection *selection,
-                      size_t layer_idx, Tensor *output) {
-  CHECK_ERROR(input->ndim == 3 && output->ndim == 4, "ExpertGateUp rank mismatch");
-  const QuantizedExpertMatrix &matrix = gate_up_proj[layer_idx];
-  const size_t total =
-      input->shape[0] * input->shape[1] * selection->K * matrix.out_dim;
-  output->ensure_gpu();
-  const dim3 block(kMoeBlockSize);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  expert_gate_up_kernel<<<grid, block>>>(
-      input->buf, input->dtype,
-      current_tokens != nullptr ? current_tokens->lengths : nullptr,
-      selection->indices, matrix.blocks, matrix.scales, matrix.bias, matrix.bias_dtype,
-      output->buf, output->dtype, input->shape[0], input->shape[1], input->shape[2],
-      selection->K, matrix.out_dim, matrix.num_experts, matrix.groups,
-      matrix.bytes_per_block, input->num_elem(), matrix.blocks_bytes,
-      matrix.num_experts * matrix.out_dim * matrix.groups,
-      matrix.num_experts * matrix.out_dim);
-  CUDA_LAUNCH_CHECK();
-}
-
-#if 0  // Legacy CPU reference retained for kernel-study notes only.
-void ExpertDown(Tensor *input, const ExpertSelection *selection, size_t layer_idx,
-                Tensor *output) {
-}
-#endif
-
-void ExpertDown_gpu(Tensor *input, const ExpertSelection *selection, size_t layer_idx,
-                    Tensor *output) {
-  CHECK_ERROR(input->ndim == 4 && output->ndim == 4, "ExpertDown rank mismatch");
-  const QuantizedExpertMatrix &matrix = down_proj[layer_idx];
-  const size_t total =
-      input->shape[0] * input->shape[1] * input->shape[2] * matrix.out_dim;
-  output->ensure_gpu();
-  const dim3 block(kMoeBlockSize);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  expert_down_kernel<<<grid, block>>>(
-      input->buf, input->dtype,
-      current_tokens != nullptr ? current_tokens->lengths : nullptr,
-      selection->indices, matrix.blocks, matrix.scales, matrix.bias, matrix.bias_dtype,
-      output->buf, output->dtype, input->shape[0], input->shape[1], input->shape[2],
-      input->shape[3], matrix.out_dim, matrix.num_experts, matrix.groups,
-      matrix.bytes_per_block, input->num_elem(), matrix.blocks_bytes,
-      matrix.num_experts * matrix.out_dim * matrix.groups,
-      matrix.num_experts * matrix.out_dim);
-  CUDA_LAUNCH_CHECK();
-}
-
-#if 0  // Legacy CPU reference retained for kernel-study notes only.
-void WeightedExpertReduce(Tensor *expert_outputs, const ExpertSelection *selection,
-                          Tensor *output) {
-}
-#endif
-
-void WeightedExpertReduce_gpu(Tensor *expert_outputs, const ExpertSelection *selection,
-                              Tensor *output) {
-  CHECK_ERROR(expert_outputs->ndim == 4 && output->ndim == 3,
-              "WeightedExpertReduce rank mismatch");
-  const size_t total = output->shape[0] * output->shape[1] * output->shape[2];
-  output->ensure_gpu();
-  const dim3 block(kMoeBlockSize);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  weighted_expert_reduce_kernel<<<grid, block>>>(
-      expert_outputs->buf, expert_outputs->dtype,
-      current_tokens != nullptr ? current_tokens->lengths : nullptr,
-      selection->weights, output->buf, output->dtype, output->shape[0],
-      output->shape[1], selection->K, output->shape[2]);
-  CUDA_LAUNCH_CHECK();
-}
-
-#if 0  // Legacy CPU reference retained for kernel-study notes only.
-void transformer_block_cpu(size_t layer_idx) {}
-#endif
-
-void transformer_block_gpu(size_t layer_idx) {
-  RMSNorm_gpu_bf16xbf16_to_bf16(x, input_norm_weight[layer_idx], norm_buf,
-                                config_.rms_norm_eps);
-
-  LinearBias_gpu_bf16xbf16xbf16_to_bf16(norm_buf, q_proj_weight[layer_idx],
-                                        q_proj_bias[layer_idx], q_proj);
-  LinearBias_gpu_bf16xbf16xbf16_to_bf16(norm_buf, k_proj_weight[layer_idx],
-                                        k_proj_bias[layer_idx], k_proj);
-  LinearBias_gpu_bf16xbf16xbf16_to_bf16(norm_buf, v_proj_weight[layer_idx],
-                                        v_proj_bias[layer_idx], v_proj);
-
-  SplitQHeadsGrouped_gpu_bf16_to_bf16(q_proj, q, config_.num_key_value_heads,
-                                      config_.q_per_kv(), config_.head_dim);
-  SplitKVHeads_gpu_bf16_to_bf16(k_proj, k, config_.num_key_value_heads,
-                                config_.head_dim);
-  SplitKVHeads_gpu_bf16_to_bf16(v_proj, v, config_.num_key_value_heads,
-                                config_.head_dim);
-  ApplyYaRNRoPE_gpu_bf16(q, k, config_);
-  AttentionScoresWithSink_gpu_bf16xbf16xbf16_to_f32(q, k, attn_sinks[layer_idx],
-                                                    att_scores);
-  ScaleMaskSoftmax_gpu_f32_to_f32(
+  SplitQHeadsGrouped(q_proj, q, config_.num_key_value_heads, config_.q_per_kv(),
+                     config_.head_dim);
+  SplitKVHeads(k_proj, k, config_.num_key_value_heads, config_.head_dim);
+  SplitKVHeads(v_proj, v, config_.num_key_value_heads, config_.head_dim);
+  ApplyYaRNRoPE(q, k, config_);
+  AttentionScoresWithSink(q, k, attn_sinks[layer_idx], att_scores);
+  ScaleMaskSoftmax(
       att_scores, att_probs, config_.head_dim, current_tokens,
       config_.uses_sliding_window(layer_idx) ? config_.sliding_window : 0);
-  AttentionContextGrouped_gpu_f32xbf16_to_bf16(att_probs, v, context);
-  MergeHeadsGrouped_gpu_bf16_to_bf16(context, merged);
-  LinearBias_gpu_bf16xbf16xbf16_to_bf16(merged, o_proj_weight[layer_idx],
-                                        o_proj_bias[layer_idx], attn_out);
-  ResidualAdd_gpu_bf16xbf16_to_bf16(x, attn_out, residual);
+  AttentionContextGrouped(att_probs, v, context);
+  MergeHeadsGrouped(context, merged);
+  LinearBias(merged, o_proj_weight[layer_idx], o_proj_bias[layer_idx], attn_out);
+  ResidualAdd(x, attn_out, residual);
   std::swap(x, residual);
 
-  RMSNorm_gpu_bf16xbf16_to_bf16(x, post_attn_norm_weight[layer_idx], moe_norm_buf,
-                                config_.rms_norm_eps);
-  LinearBias_gpu_bf16xbf16xbf16_to_bf16(moe_norm_buf, router_weight[layer_idx],
-                                        router_bias[layer_idx], router_logits);
-  TopKExperts_gpu_bf16_to_i32f32(router_logits, expert_selection);
-  ExpertGateUp_gpu(moe_norm_buf, expert_selection, layer_idx, gate_up_buf);
-  SwiGLUClamp_gpu_bf16_to_bf16(gate_up_buf, gated_buf, config_.swiglu_limit);
-  ExpertDown_gpu(gated_buf, expert_selection, layer_idx, expert_out_buf);
-  WeightedExpertReduce_gpu(expert_out_buf, expert_selection, moe_out);
-  ResidualAdd_gpu_bf16xbf16_to_bf16(x, moe_out, residual);
+  RMSNorm(x, post_attn_norm_weight[layer_idx], moe_norm_buf, config_.rms_norm_eps);
+  LinearBias(moe_norm_buf, router_weight[layer_idx], router_bias[layer_idx], router_logits);
+  TopKExperts(router_logits, expert_selection);
+  ExpertGateUp(moe_norm_buf, expert_selection, gate_up_proj[layer_idx], current_tokens,
+               gate_up_buf);
+  SwiGLUClamp(gate_up_buf, gated_buf, config_.swiglu_limit);
+  ExpertDown(gated_buf, expert_selection, down_proj[layer_idx], current_tokens,
+             expert_out_buf);
+  WeightedExpertReduce(expert_out_buf, expert_selection, current_tokens, moe_out);
+  ResidualAdd(x, moe_out, residual);
   std::swap(x, residual);
 }
 
-#if 0  // Legacy CPU reference retained for kernel-study notes only.
-void gpt_oss_forward_cpu(TokenBatch *tokens, Tensor *logits) {}
-#endif
-
-void gpt_oss_forward_gpu(DeviceTokenBatch *tokens, Tensor *logits) {
+void gpt_oss_forward_impl(DeviceTokenBatch *tokens, Tensor *logits) {
   CHECK_ERROR(tokens->B == current_batch && tokens->T == current_seq,
               "Token batch shape differs from allocated activations");
   CHECK_ERROR(logits->shape[0] == tokens->B && logits->shape[1] == tokens->T &&
@@ -660,13 +260,12 @@ void gpt_oss_forward_gpu(DeviceTokenBatch *tokens, Tensor *logits) {
               "Logits tensor shape mismatch");
 
   logits->ensure_gpu();
-  EmbeddingLookup_gpu_i32xbf16_to_bf16(tokens, tok_embeddings, x);
+  EmbeddingLookup(tokens, tok_embeddings, x);
   for (size_t layer = 0; layer < config_.num_hidden_layers; ++layer) {
-    transformer_block_gpu(layer);
+    transformer_block(layer);
   }
-  RMSNorm_gpu_bf16xbf16_to_bf16(x, final_norm_weight, final_norm,
-                                config_.rms_norm_eps);
-  LMHead_gpu_bf16xbf16_to_f32(final_norm, lm_head_weight, logits);
+  RMSNorm(x, final_norm_weight, final_norm, config_.rms_norm_eps);
+  LMHead(final_norm, lm_head_weight, logits);
 }
 
 }  // namespace
@@ -795,30 +394,215 @@ void alloc_activations(size_t batch_size, size_t seq_len) {
 
 void gpt_oss_forward(DeviceTokenBatch *tokens, Tensor *logits) {
   current_tokens = tokens;
-  gpt_oss_forward_gpu(tokens, logits);
+  gpt_oss_forward_impl(tokens, logits);
   current_tokens = nullptr;
 }
+
+#if 0  // Legacy CPU reference retained for kernel-study notes only.
+void select_next_tokens(DeviceTokenBatch *tokens, Tensor *logits, int32_t *next_tokens) {
+  CHECK_ERROR(logits->dtype == TensorDType::F32,
+              "select_next_tokens expects F32 logits");
+  CHECK_ERROR(logits->ndim == 3 && logits->shape[0] == tokens->B && logits->shape[1] == tokens->T,
+              "select_next_tokens logits shape mismatch");
+
+#pragma omp parallel for
+  for (size_t b = 0; b < tokens->B; ++b) {
+    const int32_t valid = tokens->lengths[b];
+    if (valid <= 0 || (size_t)valid > tokens->T) {
+      next_tokens[b] = 0;
+      continue;
+    }
+
+    const float *row =
+        (const float *)logits->buf + ((b * tokens->T) + (size_t)(valid - 1)) * logits->shape[2];
+    size_t best = 0;
+    float best_value = row[0];
+    for (size_t i = 1; i < logits->shape[2]; ++i) {
+      if (row[i] > best_value) {
+        best_value = row[i];
+        best = i;
+      }
+    }
+    next_tokens[b] = (int32_t)best;
+  }
+}
+#endif
+
+namespace {
+
+__global__ void argmax_last_token_kernel(const float *logits,
+                                         const int32_t *lengths,
+                                         int32_t *next_tokens, size_t B,
+                                         size_t T, size_t vocab_size) {
+  const size_t b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B) {
+    return;
+  }
+
+  const size_t valid = (size_t)lengths[b];
+  if (valid == 0 || valid > T) {
+    next_tokens[b] = 0;
+    return;
+  }
+
+  const float *row = logits + ((b * T) + (valid - 1)) * vocab_size;
+  size_t best = 0;
+  float best_value = row[0];
+  for (size_t i = 1; i < vocab_size; ++i) {
+    if (row[i] > best_value) {
+      best_value = row[i];
+      best = i;
+    }
+  }
+  next_tokens[b] = (int32_t)best;
+}
+
+}  // namespace
 
 void select_next_tokens(DeviceTokenBatch *tokens, Tensor *logits, int32_t *next_tokens) {
   CHECK_ERROR(logits->dtype == TensorDType::F32,
               "select_next_tokens expects F32 logits");
+
+  const float *logit_buf = (const float *)logits->buf;
+  const int32_t *length_buf = tokens->lengths;
+  int32_t *next_token_buf = next_tokens;
+  const size_t batch_size = tokens->B;
+  const size_t seq_len = tokens->T;
+  const size_t vocab_size = logits->shape[2];
+
   const dim3 block(kGenerationBlockSize);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(tokens->B, (size_t)block.x));
+  const dim3 grid((unsigned int)ceil_div(batch_size, (size_t)block.x));
   argmax_last_token_kernel<<<grid, block>>>(
-      (const float *)logits->buf, tokens->lengths, next_tokens, tokens->B, tokens->T,
-      logits->shape[2]);
+      logit_buf, length_buf, next_token_buf, batch_size, seq_len, vocab_size);
   CUDA_LAUNCH_CHECK();
 }
+
+#if 0  // Legacy CPU reference retained for kernel-study notes only.
+void append_next_tokens(DeviceTokenBatch *tokens, const int32_t *next_tokens,
+                        int32_t *generated_tokens, int32_t *generated_lengths,
+                        uint8_t *finished, size_t max_new_tokens) {
+  auto is_eos_host = [&](int32_t token_id) {
+    for (size_t i = 0; i < eos_token_count; ++i) {
+      if (token_id == eos_token_ids_gpu[i]) {
+        return true;
+      }
+    }
+    return false;
+  };
+
+#pragma omp parallel for
+  for (size_t b = 0; b < tokens->B; ++b) {
+    if (finished[b] != 0) {
+      continue;
+    }
+
+    const int32_t next = next_tokens[b];
+    if (is_eos_host(next)) {
+      finished[b] = 1;
+      continue;
+    }
+
+    const int32_t generated_len = generated_lengths[b];
+    if ((size_t)generated_len < max_new_tokens) {
+      generated_tokens[b * max_new_tokens + (size_t)generated_len] = next;
+      generated_lengths[b] = generated_len + 1;
+    }
+
+    int32_t valid = tokens->lengths[b];
+    if (valid < 0) {
+      valid = 0;
+    }
+    if ((size_t)valid < tokens->T) {
+      tokens->buf[b * tokens->T + (size_t)valid] = next;
+      tokens->lengths[b] = valid + 1;
+      continue;
+    }
+
+    for (size_t t = 1; t < tokens->T; ++t) {
+      tokens->buf[b * tokens->T + (t - 1)] = tokens->buf[b * tokens->T + t];
+    }
+    tokens->buf[b * tokens->T + (tokens->T - 1)] = next;
+    tokens->lengths[b] = (int32_t)tokens->T;
+  }
+}
+#endif
+
+namespace {
+
+__device__ bool is_eos_device(int32_t token_id, const int32_t *eos_ids,
+                              size_t eos_count) {
+  for (size_t i = 0; i < eos_count; ++i) {
+    if (token_id == eos_ids[i]) {
+      return true;
+    }
+  }
+  return false;
+}
+
+__global__ void append_next_tokens_kernel(
+    const int32_t *next_tokens, const int32_t *eos_ids, int32_t *window_tokens,
+    int32_t *window_lengths, int32_t *generated_tokens,
+    int32_t *generated_lengths, uint8_t *finished, size_t T,
+    size_t max_new_tokens, size_t eos_count, size_t B) {
+  const size_t b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= B) {
+    return;
+  }
+  if (finished[b] != 0) {
+    return;
+  }
+
+  const int32_t next = next_tokens[b];
+  if (is_eos_device(next, eos_ids, eos_count)) {
+    finished[b] = 1;
+    return;
+  }
+
+  int32_t generated_len = generated_lengths[b];
+  if ((size_t)generated_len < max_new_tokens) {
+    generated_tokens[b * max_new_tokens + (size_t)generated_len] = next;
+    generated_lengths[b] = generated_len + 1;
+  }
+
+  int32_t valid = window_lengths[b];
+  if (valid < 0) {
+    valid = 0;
+  }
+  if ((size_t)valid < T) {
+    window_tokens[b * T + (size_t)valid] = next;
+    window_lengths[b] = valid + 1;
+    return;
+  }
+
+  for (size_t t = 1; t < T; ++t) {
+    window_tokens[b * T + (t - 1)] = window_tokens[b * T + t];
+  }
+  window_tokens[b * T + (T - 1)] = next;
+  window_lengths[b] = (int32_t)T;
+}
+
+}  // namespace
 
 void append_next_tokens(DeviceTokenBatch *tokens, const int32_t *next_tokens,
                         int32_t *generated_tokens, int32_t *generated_lengths,
                         uint8_t *finished, size_t max_new_tokens) {
+  const int32_t *next_token_buf = next_tokens;
+  const int32_t *eos_buf = eos_token_ids_gpu;
+  int32_t *token_buf = tokens->buf;
+  int32_t *length_buf = tokens->lengths;
+  int32_t *generated_token_buf = generated_tokens;
+  int32_t *generated_length_buf = generated_lengths;
+  uint8_t *finished_buf = finished;
+  const size_t seq_len = tokens->T;
+  const size_t eos_count = eos_token_count;
+  const size_t batch_size = tokens->B;
+
   const dim3 block(kGenerationBlockSize);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(tokens->B, (size_t)block.x));
+  const dim3 grid((unsigned int)ceil_div(batch_size, (size_t)block.x));
   append_next_tokens_kernel<<<grid, block>>>(
-      tokens->buf, tokens->lengths, tokens->T, next_tokens, generated_tokens,
-      generated_lengths, finished, max_new_tokens, eos_token_ids_gpu, eos_token_count,
-      tokens->B);
+      next_token_buf, eos_buf, token_buf, length_buf, generated_token_buf,
+      generated_length_buf, finished_buf, seq_len, max_new_tokens, eos_count,
+      batch_size);
   CUDA_LAUNCH_CHECK();
 }
 

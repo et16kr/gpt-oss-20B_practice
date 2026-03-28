@@ -1,5 +1,7 @@
 #include "layer.h"
 
+#include <cuda_bf16.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -11,14 +13,17 @@
 #include <omp.h>
 #endif
 
-#include "cuda_common.h"
+#include "safetensors_loader.h"
 #include "util.h"
 
 namespace {
 
 constexpr int kBlockSize1D = 256;
-constexpr int kLinearBlockCols = 128;
+constexpr int kLinearTileSize = 16;
 constexpr int kReductionBlockSize = 256;
+constexpr int kMoeBlockSize = 128;
+
+inline size_t ceil_div(size_t n, size_t d) { return (n + d - 1) / d; }
 
 inline size_t flat_rows(Tensor *tensor) {
   CHECK_ERROR(tensor->ndim >= 2, "Tensor must have at least rank 2");
@@ -26,6 +31,9 @@ inline size_t flat_rows(Tensor *tensor) {
 }
 
 inline size_t last_dim(Tensor *tensor) { return tensor->shape[tensor->ndim - 1]; }
+
+using Mxfp4PackedByte = QuantizedExpertMatrix::Mxfp4PackedByte;
+using Mxfp4Scale = QuantizedExpertMatrix::Mxfp4Scale;
 
 struct YarnParams {
   float factor = 1.0f;
@@ -106,9 +114,91 @@ std::pair<std::vector<float>, std::vector<float>> build_yarn_cos_sin(
 }
 
 inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+
+inline float bf16_bits_to_float(uint16_t bits) {
+  union {
+    uint32_t u;
+    float f;
+  } value = {(uint32_t)bits << 16};
+  return value.f;
+}
+
+inline float fp4_value_host(uint8_t code) {
+  switch (code & 0x0F) {
+    case 0x0:
+      return +0.0f;
+    case 0x1:
+      return +0.5f;
+    case 0x2:
+      return +1.0f;
+    case 0x3:
+      return +1.5f;
+    case 0x4:
+      return +2.0f;
+    case 0x5:
+      return +3.0f;
+    case 0x6:
+      return +4.0f;
+    case 0x7:
+      return +6.0f;
+    case 0x8:
+      return -0.0f;
+    case 0x9:
+      return -0.5f;
+    case 0xA:
+      return -1.0f;
+    case 0xB:
+      return -1.5f;
+    case 0xC:
+      return -2.0f;
+    case 0xD:
+      return -3.0f;
+    case 0xE:
+      return -4.0f;
+    default:
+      return -6.0f;
+  }
+}
 #endif
 
 #define CUDA_LAUNCH_CHECK() CHECK_CUDA(cudaGetLastError())
+
+__device__ inline float fp4_value(uint8_t code) {
+  switch (code & 0x0F) {
+    case 0x0:
+      return +0.0f;
+    case 0x1:
+      return +0.5f;
+    case 0x2:
+      return +1.0f;
+    case 0x3:
+      return +1.5f;
+    case 0x4:
+      return +2.0f;
+    case 0x5:
+      return +3.0f;
+    case 0x6:
+      return +4.0f;
+    case 0x7:
+      return +6.0f;
+    case 0x8:
+      return -0.0f;
+    case 0x9:
+      return -0.5f;
+    case 0xA:
+      return -1.0f;
+    case 0xB:
+      return -1.5f;
+    case 0xC:
+      return -2.0f;
+    case 0xD:
+      return -3.0f;
+    case 0xE:
+      return -4.0f;
+    default:
+      return -6.0f;
+  }
+}
 
 __device__ inline float rope_ramp_device(float idx, float low, float high) {
   if (low == high) {
@@ -137,434 +227,6 @@ __device__ inline float rope_inv_freq_device(float rope_theta, float factor, flo
   return interpolation * ramp + extrapolation * (1.0f - ramp);
 }
 
-__global__ void embedding_lookup_kernel(const int32_t *tokens,
-                                        const uint16_t *embedding, void *output,
-                                        TensorDType output_dtype,
-                                        size_t num_tokens, size_t hidden,
-                                        size_t vocab_size) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = num_tokens * hidden;
-  if (idx >= total) {
-    return;
-  }
-
-  const size_t token_slot = idx / hidden;
-  const size_t h = idx % hidden;
-  const int32_t token_id = tokens[token_slot];
-  if (token_id < 0 || token_id >= (int32_t)vocab_size) {
-    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
-    return;
-  }
-  cuda_common::store_tensor_value(
-      output, output_dtype, idx,
-      cuda_common::bf16_to_float(embedding[(size_t)token_id * hidden + h]));
-}
-
-__global__ void rmsnorm_kernel(const void *input, TensorDType input_dtype,
-                               const void *weight, TensorDType weight_dtype,
-                               void *output, TensorDType output_dtype,
-                               size_t rows, size_t cols, float eps) {
-  const size_t row = blockIdx.x;
-  if (row >= rows) {
-    return;
-  }
-
-  __shared__ float shared[kReductionBlockSize];
-  float sum = 0.0f;
-  for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
-    const float value =
-        cuda_common::load_tensor_value(input, input_dtype, row * cols + col);
-    sum = fmaf(value, value, sum);
-  }
-  shared[threadIdx.x] = sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      shared[threadIdx.x] += shared[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-
-  const float scale = rsqrtf(shared[0] / (float)cols + eps);
-  for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
-    const size_t index = row * cols + col;
-    const float value = cuda_common::load_tensor_value(input, input_dtype, index);
-    const float w = cuda_common::load_tensor_value(weight, weight_dtype, col);
-    cuda_common::store_tensor_value(output, output_dtype, index, value * scale * w);
-  }
-}
-
-__global__ void linear_kernel(const void *input, TensorDType input_dtype,
-                              const void *weight, TensorDType weight_dtype,
-                              const void *bias, TensorDType bias_dtype,
-                              void *output, TensorDType output_dtype,
-                              size_t rows, size_t in_dim, size_t out_dim,
-                              bool has_bias) {
-  const size_t row = blockIdx.y;
-  const size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= rows || col >= out_dim) {
-    return;
-  }
-
-  float sum = has_bias ? cuda_common::load_tensor_value(bias, bias_dtype, col) : 0.0f;
-  for (size_t k = 0; k < in_dim; ++k) {
-    const float lhs =
-        cuda_common::load_tensor_value(input, input_dtype, row * in_dim + k);
-    const float rhs =
-        cuda_common::load_tensor_value(weight, weight_dtype, col * in_dim + k);
-    sum = fmaf(lhs, rhs, sum);
-  }
-  cuda_common::store_tensor_value(output, output_dtype, row * out_dim + col, sum);
-}
-
-__global__ void split_q_heads_grouped_kernel(const uint16_t *input,
-                                             uint16_t *output, size_t B, size_t T,
-                                             size_t num_kv_heads, size_t q_per_kv,
-                                             size_t head_dim) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * num_kv_heads * q_per_kv * T * head_dim;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t d = tmp % head_dim;
-  tmp /= head_dim;
-  const size_t t = tmp % T;
-  tmp /= T;
-  const size_t qm = tmp % q_per_kv;
-  tmp /= q_per_kv;
-  const size_t kv = tmp % num_kv_heads;
-  const size_t b = tmp / num_kv_heads;
-
-  const size_t src_head = kv * q_per_kv + qm;
-  const size_t src =
-      (b * T + t) * (num_kv_heads * q_per_kv * head_dim) + src_head * head_dim + d;
-  output[idx] = input[src];
-}
-
-__global__ void split_kv_heads_kernel(const uint16_t *input, uint16_t *output,
-                                      size_t B, size_t T, size_t num_kv_heads,
-                                      size_t head_dim) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * num_kv_heads * T * head_dim;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t d = tmp % head_dim;
-  tmp /= head_dim;
-  const size_t t = tmp % T;
-  tmp /= T;
-  const size_t kv = tmp % num_kv_heads;
-  const size_t b = tmp / num_kv_heads;
-
-  const size_t src = (b * T + t) * (num_kv_heads * head_dim) + kv * head_dim + d;
-  output[idx] = input[src];
-}
-
-__global__ void apply_yarn_q_kernel(uint16_t *q, size_t B, size_t KV, size_t QM,
-                                    size_t T, size_t D, float rope_theta,
-                                    float factor, float low, float high,
-                                    float attention_factor) {
-  const size_t half = D / 2;
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * KV * QM * T * half;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t d = tmp % half;
-  tmp /= half;
-  const size_t t = tmp % T;
-  tmp /= T;
-  const size_t qm = tmp % QM;
-  tmp /= QM;
-  const size_t kv = tmp % KV;
-  const size_t b = tmp / KV;
-
-  const size_t base = ((((b * KV + kv) * QM + qm) * T + t) * D);
-  const float angle =
-      (float)t * rope_inv_freq_device(rope_theta, factor, low, high, D, d);
-  const float c = cosf(angle) * attention_factor;
-  const float s = sinf(angle) * attention_factor;
-  const float x0 = cuda_common::bf16_to_float(q[base + d]);
-  const float x1 = cuda_common::bf16_to_float(q[base + d + half]);
-  q[base + d] = cuda_common::float_to_bf16(x0 * c - x1 * s);
-  q[base + d + half] = cuda_common::float_to_bf16(x1 * c + x0 * s);
-}
-
-__global__ void apply_yarn_k_kernel(uint16_t *k, size_t B, size_t KV, size_t T,
-                                    size_t D, float rope_theta, float factor,
-                                    float low, float high,
-                                    float attention_factor) {
-  const size_t half = D / 2;
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * KV * T * half;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t d = tmp % half;
-  tmp /= half;
-  const size_t t = tmp % T;
-  tmp /= T;
-  const size_t kv = tmp % KV;
-  const size_t b = tmp / KV;
-
-  const size_t base = (((b * KV + kv) * T + t) * D);
-  const float angle =
-      (float)t * rope_inv_freq_device(rope_theta, factor, low, high, D, d);
-  const float c = cosf(angle) * attention_factor;
-  const float s = sinf(angle) * attention_factor;
-  const float x0 = cuda_common::bf16_to_float(k[base + d]);
-  const float x1 = cuda_common::bf16_to_float(k[base + d + half]);
-  k[base + d] = cuda_common::float_to_bf16(x0 * c - x1 * s);
-  k[base + d + half] = cuda_common::float_to_bf16(x1 * c + x0 * s);
-}
-
-__global__ void attention_scores_with_sink_kernel(
-    const uint16_t *q, const uint16_t *k, const void *sinks, TensorDType sink_dtype,
-    float *scores, size_t B, size_t KV, size_t QM, size_t T, size_t D) {
-  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t rows = B * KV * QM * T;
-  if (row >= rows) {
-    return;
-  }
-
-  size_t tmp = row;
-  const size_t tq = tmp % T;
-  tmp /= T;
-  const size_t qm = tmp % QM;
-  tmp /= QM;
-  const size_t kv = tmp % KV;
-  const size_t b = tmp / KV;
-
-  const size_t q_base = ((((b * KV + kv) * QM + qm) * T + tq) * D);
-  const size_t score_base = row * (T + 1);
-  for (size_t tk = 0; tk < T; ++tk) {
-    const size_t k_base = (((b * KV + kv) * T + tk) * D);
-    float sum = 0.0f;
-    for (size_t d = 0; d < D; ++d) {
-      sum = fmaf(cuda_common::bf16_to_float(q[q_base + d]),
-                 cuda_common::bf16_to_float(k[k_base + d]), sum);
-    }
-    scores[score_base + tk] = sum;
-  }
-  scores[score_base + T] =
-      cuda_common::load_tensor_value(sinks, sink_dtype, kv * QM + qm);
-}
-
-__global__ void scale_mask_softmax_kernel(const float *scores, float *probs,
-                                          const int32_t *lengths,
-                                          size_t B, size_t KV, size_t QM,
-                                          size_t T, size_t head_dim,
-                                          size_t sliding_window) {
-  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t rows = B * KV * QM * T;
-  if (row >= rows) {
-    return;
-  }
-
-  const float scale = rsqrtf((float)head_dim);
-  size_t tmp = row;
-  const size_t tq = tmp % T;
-  tmp /= T;
-  tmp /= QM;
-  const size_t b = tmp / KV;
-
-  const size_t valid_t = lengths != nullptr ? (size_t)lengths[b] : T;
-  const size_t row_base = row * (T + 1);
-  for (size_t i = 0; i < T + 1; ++i) {
-    probs[row_base + i] = 0.0f;
-  }
-  if (tq >= valid_t) {
-    return;
-  }
-
-  size_t tk_begin = 0;
-  if (sliding_window > 0 && tq + 1 > sliding_window) {
-    tk_begin = tq + 1 - sliding_window;
-  }
-  const size_t tk_end = min(tq, valid_t - 1);
-
-  float row_max = -1.0e30f;
-  for (size_t tk = tk_begin; tk <= tk_end; ++tk) {
-    row_max = max(row_max, scores[row_base + tk] * scale);
-  }
-  row_max = max(row_max, scores[row_base + T]);
-
-  float sum = 0.0f;
-  for (size_t tk = tk_begin; tk <= tk_end; ++tk) {
-    const float e = expf(scores[row_base + tk] * scale - row_max);
-    probs[row_base + tk] = e;
-    sum += e;
-  }
-  const float sink_exp = expf(scores[row_base + T] - row_max);
-  probs[row_base + T] = sink_exp;
-  sum += sink_exp;
-
-  if (sum > 0.0f) {
-    const float inv_sum = 1.0f / sum;
-    for (size_t tk = tk_begin; tk <= tk_end; ++tk) {
-      probs[row_base + tk] *= inv_sum;
-    }
-    probs[row_base + T] *= inv_sum;
-  }
-}
-
-__global__ void attention_context_grouped_kernel(const float *probs,
-                                                 const uint16_t *v, void *context,
-                                                 TensorDType context_dtype,
-                                                 size_t B, size_t KV, size_t QM,
-                                                 size_t T, size_t D) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * KV * QM * T * D;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t d = tmp % D;
-  tmp /= D;
-  const size_t tq = tmp % T;
-  tmp /= T;
-  const size_t qm = tmp % QM;
-  tmp /= QM;
-  const size_t kv = tmp % KV;
-  const size_t b = tmp / KV;
-
-  const size_t prob_base = ((((b * KV + kv) * QM + qm) * T + tq) * (T + 1));
-  float sum = 0.0f;
-  for (size_t tk = 0; tk < T; ++tk) {
-    const size_t v_base = (((b * KV + kv) * T + tk) * D);
-    sum = fmaf(probs[prob_base + tk], cuda_common::bf16_to_float(v[v_base + d]),
-               sum);
-  }
-  cuda_common::store_tensor_value(context, context_dtype, idx, sum);
-}
-
-__global__ void merge_heads_grouped_kernel(const void *context,
-                                           TensorDType context_dtype,
-                                           void *merged,
-                                           TensorDType merged_dtype, size_t B,
-                                           size_t KV, size_t QM, size_t T,
-                                           size_t D) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = B * KV * QM * T * D;
-  if (idx >= total) {
-    return;
-  }
-
-  size_t tmp = idx;
-  const size_t d = tmp % D;
-  tmp /= D;
-  const size_t t = tmp % T;
-  tmp /= T;
-  const size_t qm = tmp % QM;
-  tmp /= QM;
-  const size_t kv = tmp % KV;
-  const size_t b = tmp / KV;
-
-  const size_t head = kv * QM + qm;
-  const size_t dst = (b * T + t) * (KV * QM * D) + head * D + d;
-  const float value = cuda_common::load_tensor_value(context, context_dtype, idx);
-  cuda_common::store_tensor_value(merged, merged_dtype, dst, value);
-}
-
-__global__ void residual_add_kernel(const void *input, TensorDType input_dtype,
-                                    const void *addend, TensorDType addend_dtype,
-                                    void *output, TensorDType output_dtype, size_t n) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= n) {
-    return;
-  }
-
-  const float lhs = cuda_common::load_tensor_value(input, input_dtype, idx);
-  const float rhs = cuda_common::load_tensor_value(addend, addend_dtype, idx);
-  cuda_common::store_tensor_value(output, output_dtype, idx, lhs + rhs);
-}
-
-__global__ void topk_experts_kernel(const void *router_logits,
-                                    TensorDType router_dtype, int32_t *indices,
-                                    float *weights, size_t rows, size_t experts,
-                                    size_t topk) {
-  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row >= rows) {
-    return;
-  }
-
-  constexpr int kMaxTopK = 8;
-  float best_values[kMaxTopK];
-  int32_t best_indices[kMaxTopK];
-  for (size_t i = 0; i < topk; ++i) {
-    best_values[i] = -1.0e30f;
-    best_indices[i] = -1;
-  }
-
-  const size_t base = row * experts;
-  for (size_t e = 0; e < experts; ++e) {
-    float value = cuda_common::load_tensor_value(router_logits, router_dtype, base + e);
-    if (!isfinite(value)) {
-      value = -1.0e30f;
-    }
-    for (size_t k = 0; k < topk; ++k) {
-      if (value > best_values[k] ||
-          (value == best_values[k] && (int32_t)e < best_indices[k])) {
-        for (size_t shift = topk - 1; shift > k; --shift) {
-          best_values[shift] = best_values[shift - 1];
-          best_indices[shift] = best_indices[shift - 1];
-        }
-        best_values[k] = value;
-        best_indices[k] = (int32_t)e;
-        break;
-      }
-    }
-  }
-
-  float row_max = best_values[0];
-  float sum = 0.0f;
-  for (size_t k = 0; k < topk; ++k) {
-    indices[row * topk + k] = best_indices[k];
-    const float w = expf(best_values[k] - row_max);
-    weights[row * topk + k] = w;
-    sum += w;
-  }
-  const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
-  for (size_t k = 0; k < topk; ++k) {
-    weights[row * topk + k] *= inv_sum;
-  }
-}
-
-__global__ void swiglu_clamp_kernel(const uint16_t *input, uint16_t *output,
-                                    size_t rows, size_t out_dim, float limit) {
-  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const size_t total = rows * out_dim;
-  if (idx >= total) {
-    return;
-  }
-
-  const size_t row = idx / out_dim;
-  const size_t col = idx % out_dim;
-  const size_t base = row * out_dim * 2 + col * 2;
-  float gate = cuda_common::bf16_to_float(input[base]);
-  float up = cuda_common::bf16_to_float(input[base + 1]);
-  if (gate > limit) {
-    gate = limit;
-  }
-  if (up > limit) {
-    up = limit;
-  } else if (up < -limit) {
-    up = -limit;
-  }
-  const float value = (up + 1.0f) * gate * cuda_common::sigmoid(1.702f * gate);
-  output[idx] = cuda_common::float_to_bf16(value);
-}
-
 }  // namespace
 
 #if 0  // Legacy CPU reference retained for kernel-study notes only.
@@ -582,10 +244,12 @@ void EmbeddingLookup(TokenBatch *tokens, Tensor *embedding, Tensor *output) {
   for (size_t b = 0; b < tokens->B; ++b) {
     for (size_t t = 0; t < tokens->T; ++t) {
       const int32_t token_id = tokens->buf[b * tokens->T + t];
-      CHECK_ERROR(token_id >= 0 && token_id < (int32_t)vocab_size,
-                  "Token id %d out of range", token_id);
-      const float *src = embedding->buf + (size_t)token_id * hidden;
       float *dst = output->buf + (b * tokens->T + t) * hidden;
+      if (token_id < 0 || token_id >= (int32_t)vocab_size) {
+        memset(dst, 0, hidden * sizeof(float));
+        continue;
+      }
+      const float *src = embedding->buf + (size_t)token_id * hidden;
       memcpy(dst, src, hidden * sizeof(float));
     }
   }
@@ -593,20 +257,49 @@ void EmbeddingLookup(TokenBatch *tokens, Tensor *embedding, Tensor *output) {
 }
 #endif
 
-void EmbeddingLookup_gpu_i32xbf16_to_bf16(DeviceTokenBatch *tokens, Tensor *embedding,
-                                          Tensor *output) {
+namespace {
+
+__global__ void embedding_lookup_kernel_i32xbf16_to_bf16(
+    const int32_t *tokens, const __nv_bfloat16 *embedding,
+    __nv_bfloat16 *output, size_t num_tokens, size_t hidden,
+    size_t vocab_size) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = num_tokens * hidden;
+  if (idx >= total) {
+    return;
+  }
+
+  const size_t token_slot = idx / hidden;
+  const size_t h = idx % hidden;
+  const int32_t token_id = tokens[token_slot];
+  if (token_id < 0 || token_id >= (int32_t)vocab_size) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+  output[idx] = embedding[(size_t)token_id * hidden + h];
+}
+
+}  // namespace
+
+void EmbeddingLookup(DeviceTokenBatch *tokens, Tensor *embedding, Tensor *output) {
   CHECK_ERROR(embedding->dtype == TensorDType::BF16,
-              "Embedding GPU path expects BF16 weights");
+              "EmbeddingLookup expects BF16 weights");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "EmbeddingLookup expects BF16 output");
   embedding->ensure_gpu();
   output->ensure_gpu();
+
+  const int32_t *token_buf = tokens->buf;
+  const __nv_bfloat16 *embedding_buf = (const __nv_bfloat16 *)embedding->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
   const size_t num_tokens = tokens->B * tokens->T;
   const size_t hidden = embedding->shape[1];
+  const size_t vocab_size = embedding->shape[0];
   const size_t total = num_tokens * hidden;
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  embedding_lookup_kernel<<<grid, block>>>(
-      tokens->buf, (const uint16_t *)embedding->buf, output->buf, output->dtype,
-      num_tokens, hidden, embedding->shape[0]);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  embedding_lookup_kernel_i32xbf16_to_bf16<<<grid, block>>>(
+      token_buf, embedding_buf, output_buf, num_tokens, hidden, vocab_size);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -638,15 +331,60 @@ void RMSNorm(Tensor *input, Tensor *weight, Tensor *output, float eps) {
 }
 #endif
 
-void RMSNorm_gpu_bf16xbf16_to_bf16(Tensor *input, Tensor *weight, Tensor *output,
-                                   float eps) {
+namespace {
+
+__global__ void rmsnorm_kernel_bf16xbf16_to_bf16(const __nv_bfloat16 *input,
+                                                 const __nv_bfloat16 *weight,
+                                                 __nv_bfloat16 *output,
+                                                 size_t rows, size_t cols,
+                                                 float eps) {
+  const size_t row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  __shared__ float shared[kReductionBlockSize];
+  float sum = 0.0f;
+  for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    const float value = __bfloat162float(input[row * cols + col]);
+    sum = fmaf(value, value, sum);
+  }
+  shared[threadIdx.x] = sum;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      shared[threadIdx.x] += shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  const float scale = rsqrtf(shared[0] / (float)cols + eps);
+  for (size_t col = threadIdx.x; col < cols; col += blockDim.x) {
+    const size_t index = row * cols + col;
+    const float value = __bfloat162float(input[index]);
+    const float w = __bfloat162float(weight[col]);
+    output[index] = __float2bfloat16_rn(value * scale * w);
+  }
+}
+
+}  // namespace
+
+void RMSNorm(Tensor *input, Tensor *weight, Tensor *output, float eps) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "RMSNorm expects BF16 input");
+  CHECK_ERROR(weight->dtype == TensorDType::BF16, "RMSNorm expects BF16 weight");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "RMSNorm expects BF16 output");
   weight->ensure_gpu();
   output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  const __nv_bfloat16 *weight_buf = (const __nv_bfloat16 *)weight->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
   const size_t rows = flat_rows(input);
   const size_t cols = last_dim(input);
-  rmsnorm_kernel<<<(unsigned int)rows, kReductionBlockSize>>>(
-      input->buf, input->dtype, weight->buf, weight->dtype, output->buf,
-      output->dtype, rows, cols, eps);
+
+  rmsnorm_kernel_bf16xbf16_to_bf16<<<(unsigned int)rows, kReductionBlockSize>>>(
+      input_buf, weight_buf, output_buf, rows, cols, eps);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -680,20 +418,67 @@ void LinearBias(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
 }
 #endif
 
-void LinearBias_gpu_bf16xbf16xbf16_to_bf16(Tensor *input, Tensor *weight,
-                                           Tensor *bias, Tensor *output) {
+namespace {
+
+__global__ void linear_bias_kernel_bf16xbf16xbf16_to_bf16(
+    const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
+    const __nv_bfloat16 *bias, __nv_bfloat16 *output, size_t rows,
+    size_t in_dim, size_t out_dim) {
+  const size_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  const size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool valid = row < rows && col < out_dim;
+
+  __shared__ __nv_bfloat16 input_tile[kLinearTileSize][kLinearTileSize];
+  __shared__ __nv_bfloat16 weight_tile[kLinearTileSize][kLinearTileSize];
+
+  float sum = valid ? __bfloat162float(bias[col]) : 0.0f;
+  for (size_t k0 = 0; k0 < in_dim; k0 += kLinearTileSize) {
+    const size_t input_col = k0 + threadIdx.x;
+    const size_t weight_row = k0 + threadIdx.y;
+    input_tile[threadIdx.y][threadIdx.x] =
+        (row < rows && input_col < in_dim) ? input[row * in_dim + input_col]
+                                           : __float2bfloat16_rn(0.0f);
+    weight_tile[threadIdx.y][threadIdx.x] =
+        (col < out_dim && weight_row < in_dim)
+            ? weight[col * in_dim + weight_row]
+            : __float2bfloat16_rn(0.0f);
+    __syncthreads();
+
+    for (size_t k = 0; k < kLinearTileSize && (k0 + k) < in_dim; ++k) {
+      sum = fmaf(__bfloat162float(input_tile[threadIdx.y][k]),
+                 __bfloat162float(weight_tile[k][threadIdx.x]), sum);
+    }
+    __syncthreads();
+  }
+  if (valid) {
+    output[row * out_dim + col] = __float2bfloat16_rn(sum);
+  }
+}
+
+}  // namespace
+
+void LinearBias(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "LinearBias expects BF16 input");
+  CHECK_ERROR(weight->dtype == TensorDType::BF16, "LinearBias expects BF16 weight");
+  CHECK_ERROR(bias->dtype == TensorDType::BF16, "LinearBias expects BF16 bias");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "LinearBias expects BF16 output");
   weight->ensure_gpu();
   bias->ensure_gpu();
   output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  const __nv_bfloat16 *weight_buf = (const __nv_bfloat16 *)weight->buf;
+  const __nv_bfloat16 *bias_buf = (const __nv_bfloat16 *)bias->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
   const size_t rows = flat_rows(input);
   const size_t in_dim = last_dim(input);
   const size_t out_dim = weight->shape[0];
-  const dim3 block(kLinearBlockCols);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(out_dim, (size_t)block.x),
-                  (unsigned int)rows);
-  linear_kernel<<<grid, block>>>(
-      input->buf, input->dtype, weight->buf, weight->dtype, bias->buf, bias->dtype,
-      output->buf, output->dtype, rows, in_dim, out_dim, true);
+
+  const dim3 block(kLinearTileSize, kLinearTileSize);
+  const dim3 grid((unsigned int)ceil_div(out_dim, (size_t)block.x),
+                  (unsigned int)ceil_div(rows, (size_t)block.y));
+  linear_bias_kernel_bf16xbf16xbf16_to_bf16<<<grid, block>>>(
+      input_buf, weight_buf, bias_buf, output_buf, rows, in_dim, out_dim);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -724,18 +509,65 @@ void Linear(Tensor *input, Tensor *weight, Tensor *output) {
 }
 #endif
 
-void Linear_gpu_bf16xbf16_to_bf16(Tensor *input, Tensor *weight, Tensor *output) {
+namespace {
+
+__global__ void linear_kernel_bf16xbf16_to_bf16(const __nv_bfloat16 *input,
+                                                const __nv_bfloat16 *weight,
+                                                __nv_bfloat16 *output,
+                                                size_t rows, size_t in_dim,
+                                                size_t out_dim) {
+  const size_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  const size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool valid = row < rows && col < out_dim;
+
+  __shared__ __nv_bfloat16 input_tile[kLinearTileSize][kLinearTileSize];
+  __shared__ __nv_bfloat16 weight_tile[kLinearTileSize][kLinearTileSize];
+
+  float sum = 0.0f;
+  for (size_t k0 = 0; k0 < in_dim; k0 += kLinearTileSize) {
+    const size_t input_col = k0 + threadIdx.x;
+    const size_t weight_row = k0 + threadIdx.y;
+    input_tile[threadIdx.y][threadIdx.x] =
+        (row < rows && input_col < in_dim) ? input[row * in_dim + input_col]
+                                           : __float2bfloat16_rn(0.0f);
+    weight_tile[threadIdx.y][threadIdx.x] =
+        (col < out_dim && weight_row < in_dim)
+            ? weight[col * in_dim + weight_row]
+            : __float2bfloat16_rn(0.0f);
+    __syncthreads();
+
+    for (size_t k = 0; k < kLinearTileSize && (k0 + k) < in_dim; ++k) {
+      sum = fmaf(__bfloat162float(input_tile[threadIdx.y][k]),
+                 __bfloat162float(weight_tile[k][threadIdx.x]), sum);
+    }
+    __syncthreads();
+  }
+  if (valid) {
+    output[row * out_dim + col] = __float2bfloat16_rn(sum);
+  }
+}
+
+}  // namespace
+
+void Linear(Tensor *input, Tensor *weight, Tensor *output) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "Linear expects BF16 input");
+  CHECK_ERROR(weight->dtype == TensorDType::BF16, "Linear expects BF16 weight");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "Linear expects BF16 output");
   weight->ensure_gpu();
   output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  const __nv_bfloat16 *weight_buf = (const __nv_bfloat16 *)weight->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
   const size_t rows = flat_rows(input);
   const size_t in_dim = last_dim(input);
   const size_t out_dim = weight->shape[0];
-  const dim3 block(kLinearBlockCols);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(out_dim, (size_t)block.x),
-                  (unsigned int)rows);
-  linear_kernel<<<grid, block>>>(
-      input->buf, input->dtype, weight->buf, weight->dtype, nullptr,
-      TensorDType::F32, output->buf, output->dtype, rows, in_dim, out_dim, false);
+
+  const dim3 block(kLinearTileSize, kLinearTileSize);
+  const dim3 grid((unsigned int)ceil_div(out_dim, (size_t)block.x),
+                  (unsigned int)ceil_div(rows, (size_t)block.y));
+  linear_kernel_bf16xbf16_to_bf16<<<grid, block>>>(
+      input_buf, weight_buf, output_buf, rows, in_dim, out_dim);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -774,17 +606,53 @@ void SplitQHeadsGrouped(Tensor *input, Tensor *output, size_t num_kv_heads,
 }
 #endif
 
-void SplitQHeadsGrouped_gpu_bf16_to_bf16(Tensor *input, Tensor *output,
-                                         size_t num_kv_heads, size_t q_per_kv,
-                                         size_t head_dim) {
+namespace {
+
+__global__ void split_q_heads_grouped_kernel_bf16_to_bf16(
+    const __nv_bfloat16 *input, __nv_bfloat16 *output, size_t B, size_t T,
+    size_t num_kv_heads, size_t q_per_kv, size_t head_dim) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * num_kv_heads * q_per_kv * T * head_dim;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t d = tmp % head_dim;
+  tmp /= head_dim;
+  const size_t t = tmp % T;
+  tmp /= T;
+  const size_t qm = tmp % q_per_kv;
+  tmp /= q_per_kv;
+  const size_t kv = tmp % num_kv_heads;
+  const size_t b = tmp / num_kv_heads;
+
+  const size_t src_head = kv * q_per_kv + qm;
+  const size_t src =
+      (b * T + t) * (num_kv_heads * q_per_kv * head_dim) + src_head * head_dim + d;
+  output[idx] = input[src];
+}
+
+}  // namespace
+
+void SplitQHeadsGrouped(Tensor *input, Tensor *output, size_t num_kv_heads,
+                        size_t q_per_kv, size_t head_dim) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "SplitQHeadsGrouped expects BF16 input");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "SplitQHeadsGrouped expects BF16 output");
   output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
+  const size_t batch_size = input->shape[0];
+  const size_t seq_len = input->shape[1];
   const size_t total = input->shape[0] * num_kv_heads * q_per_kv * input->shape[1] *
                        head_dim;
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  split_q_heads_grouped_kernel<<<grid, block>>>(
-      (const uint16_t *)input->buf, (uint16_t *)output->buf, input->shape[0],
-      input->shape[1], num_kv_heads, q_per_kv, head_dim);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  split_q_heads_grouped_kernel_bf16_to_bf16<<<grid, block>>>(
+      input_buf, output_buf, batch_size, seq_len, num_kv_heads, q_per_kv,
+      head_dim);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -817,16 +685,47 @@ void SplitKVHeads(Tensor *input, Tensor *output, size_t num_kv_heads,
 }
 #endif
 
-void SplitKVHeads_gpu_bf16_to_bf16(Tensor *input, Tensor *output,
-                                   size_t num_kv_heads, size_t head_dim) {
+namespace {
+
+__global__ void split_kv_heads_kernel_bf16_to_bf16(
+    const __nv_bfloat16 *input, __nv_bfloat16 *output, size_t B, size_t T,
+    size_t num_kv_heads, size_t head_dim) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * num_kv_heads * T * head_dim;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t d = tmp % head_dim;
+  tmp /= head_dim;
+  const size_t t = tmp % T;
+  tmp /= T;
+  const size_t kv = tmp % num_kv_heads;
+  const size_t b = tmp / num_kv_heads;
+
+  const size_t src = (b * T + t) * (num_kv_heads * head_dim) + kv * head_dim + d;
+  output[idx] = input[src];
+}
+
+}  // namespace
+
+void SplitKVHeads(Tensor *input, Tensor *output, size_t num_kv_heads,
+                  size_t head_dim) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "SplitKVHeads expects BF16 input");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "SplitKVHeads expects BF16 output");
   output->ensure_gpu();
-  const size_t total = input->shape[0] * num_kv_heads * input->shape[1] * head_dim;
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
+  const size_t batch_size = input->shape[0];
+  const size_t seq_len = input->shape[1];
+  const size_t total = batch_size * num_kv_heads * seq_len * head_dim;
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  split_kv_heads_kernel<<<grid, block>>>((const uint16_t *)input->buf,
-                                         (uint16_t *)output->buf,
-                                         input->shape[0], input->shape[1],
-                                         num_kv_heads, head_dim);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  split_kv_heads_kernel_bf16_to_bf16<<<grid, block>>>(
+      input_buf, output_buf, batch_size, seq_len, num_kv_heads, head_dim);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -887,23 +786,104 @@ void ApplyYaRNRoPE(Tensor *q, Tensor *k, const GptOssConfig &config) {
 }
 #endif
 
-void ApplyYaRNRoPE_gpu_bf16(Tensor *q, Tensor *k, const GptOssConfig &config) {
+namespace {
+
+__global__ void apply_yarn_q_kernel_bf16(__nv_bfloat16 *q, size_t B, size_t KV,
+                                         size_t QM, size_t T, size_t D,
+                                         float rope_theta, float factor,
+                                         float low, float high,
+                                         float attention_factor) {
+  const size_t half = D / 2;
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * KV * QM * T * half;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t d = tmp % half;
+  tmp /= half;
+  const size_t t = tmp % T;
+  tmp /= T;
+  const size_t qm = tmp % QM;
+  tmp /= QM;
+  const size_t kv = tmp % KV;
+  const size_t b = tmp / KV;
+
+  const size_t base = ((((b * KV + kv) * QM + qm) * T + t) * D);
+  const float angle =
+      (float)t * rope_inv_freq_device(rope_theta, factor, low, high, D, d);
+  const float c = cosf(angle) * attention_factor;
+  const float s = sinf(angle) * attention_factor;
+  const float x0 = __bfloat162float(q[base + d]);
+  const float x1 = __bfloat162float(q[base + d + half]);
+  q[base + d] = __float2bfloat16_rn(x0 * c - x1 * s);
+  q[base + d + half] = __float2bfloat16_rn(x1 * c + x0 * s);
+}
+
+__global__ void apply_yarn_k_kernel_bf16(__nv_bfloat16 *k, size_t B, size_t KV,
+                                         size_t T, size_t D, float rope_theta,
+                                         float factor, float low, float high,
+                                         float attention_factor) {
+  const size_t half = D / 2;
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * KV * T * half;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t d = tmp % half;
+  tmp /= half;
+  const size_t t = tmp % T;
+  tmp /= T;
+  const size_t kv = tmp % KV;
+  const size_t b = tmp / KV;
+
+  const size_t base = (((b * KV + kv) * T + t) * D);
+  const float angle =
+      (float)t * rope_inv_freq_device(rope_theta, factor, low, high, D, d);
+  const float c = cosf(angle) * attention_factor;
+  const float s = sinf(angle) * attention_factor;
+  const float x0 = __bfloat162float(k[base + d]);
+  const float x1 = __bfloat162float(k[base + d + half]);
+  k[base + d] = __float2bfloat16_rn(x0 * c - x1 * s);
+  k[base + d + half] = __float2bfloat16_rn(x1 * c + x0 * s);
+}
+
+}  // namespace
+
+void ApplyYaRNRoPE(Tensor *q, Tensor *k, const GptOssConfig &config) {
+  CHECK_ERROR(q->dtype == TensorDType::BF16, "ApplyYaRNRoPE expects BF16 q");
+  CHECK_ERROR(k->dtype == TensorDType::BF16, "ApplyYaRNRoPE expects BF16 k");
+
+  __nv_bfloat16 *q_buf = (__nv_bfloat16 *)q->buf;
+  __nv_bfloat16 *k_buf = (__nv_bfloat16 *)k->buf;
   const YarnParams params = build_yarn_params(config, q->shape[4]);
+  const size_t q_B = q->shape[0];
+  const size_t q_KV = q->shape[1];
+  const size_t q_QM = q->shape[2];
+  const size_t q_T = q->shape[3];
+  const size_t q_D = q->shape[4];
+  const size_t k_B = k->shape[0];
+  const size_t k_KV = k->shape[1];
+  const size_t k_T = k->shape[2];
+  const size_t k_D = k->shape[3];
   const size_t q_total = q->shape[0] * q->shape[1] * q->shape[2] * q->shape[3] *
                          (q->shape[4] / 2);
   const size_t k_total = k->shape[0] * k->shape[1] * k->shape[2] *
                          (k->shape[3] / 2);
+
   const dim3 block(kBlockSize1D);
-  const dim3 q_grid((unsigned int)cuda_common::ceil_div(q_total, (size_t)block.x));
-  const dim3 k_grid((unsigned int)cuda_common::ceil_div(k_total, (size_t)block.x));
-  apply_yarn_q_kernel<<<q_grid, block>>>(
-      (uint16_t *)q->buf, q->shape[0], q->shape[1], q->shape[2], q->shape[3],
-      q->shape[4], config.rope_theta, params.factor, params.low, params.high,
-      params.attention_factor);
+  const dim3 q_grid((unsigned int)ceil_div(q_total, (size_t)block.x));
+  const dim3 k_grid((unsigned int)ceil_div(k_total, (size_t)block.x));
+  apply_yarn_q_kernel_bf16<<<q_grid, block>>>(
+      q_buf, q_B, q_KV, q_QM, q_T, q_D, config.rope_theta, params.factor,
+      params.low, params.high, params.attention_factor);
   CUDA_LAUNCH_CHECK();
-  apply_yarn_k_kernel<<<k_grid, block>>>(
-      (uint16_t *)k->buf, k->shape[0], k->shape[1], k->shape[2], k->shape[3],
-      config.rope_theta, params.factor, params.low, params.high,
+  apply_yarn_k_kernel_bf16<<<k_grid, block>>>(
+      k_buf, k_B, k_KV, k_T, k_D, config.rope_theta, params.factor, params.low,
+      params.high,
       params.attention_factor);
   CUDA_LAUNCH_CHECK();
 }
@@ -951,18 +931,67 @@ void AttentionScoresWithSink(Tensor *q, Tensor *k, Tensor *sinks, Tensor *scores
 }
 #endif
 
-void AttentionScoresWithSink_gpu_bf16xbf16xbf16_to_f32(Tensor *q, Tensor *k,
-                                                       Tensor *sinks,
-                                                       Tensor *scores) {
+namespace {
+
+__global__ void attention_scores_with_sink_kernel_bf16xbf16xbf16_to_f32(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+    const __nv_bfloat16 *sinks, float *scores, size_t B, size_t KV, size_t QM,
+    size_t T, size_t D) {
+  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t rows = B * KV * QM * T;
+  if (row >= rows) {
+    return;
+  }
+
+  size_t tmp = row;
+  const size_t tq = tmp % T;
+  tmp /= T;
+  const size_t qm = tmp % QM;
+  tmp /= QM;
+  const size_t kv = tmp % KV;
+  const size_t b = tmp / KV;
+
+  const size_t q_base = ((((b * KV + kv) * QM + qm) * T + tq) * D);
+  const size_t score_base = row * (T + 1);
+  for (size_t tk = 0; tk < T; ++tk) {
+    const size_t k_base = (((b * KV + kv) * T + tk) * D);
+    float sum = 0.0f;
+    for (size_t d = 0; d < D; ++d) {
+      sum = fmaf(__bfloat162float(q[q_base + d]),
+                 __bfloat162float(k[k_base + d]), sum);
+    }
+    scores[score_base + tk] = sum;
+  }
+  scores[score_base + T] = __bfloat162float(sinks[kv * QM + qm]);
+}
+
+}  // namespace
+
+void AttentionScoresWithSink(Tensor *q, Tensor *k, Tensor *sinks, Tensor *scores) {
+  CHECK_ERROR(q->dtype == TensorDType::BF16, "AttentionScoresWithSink expects BF16 q");
+  CHECK_ERROR(k->dtype == TensorDType::BF16, "AttentionScoresWithSink expects BF16 k");
+  CHECK_ERROR(sinks->dtype == TensorDType::BF16,
+              "AttentionScoresWithSink expects BF16 sinks");
+  CHECK_ERROR(scores->dtype == TensorDType::F32, "AttentionScoresWithSink expects F32 scores");
   sinks->ensure_gpu();
   scores->ensure_gpu();
+
+  const __nv_bfloat16 *q_buf = (const __nv_bfloat16 *)q->buf;
+  const __nv_bfloat16 *k_buf = (const __nv_bfloat16 *)k->buf;
+  const __nv_bfloat16 *sink_buf = (const __nv_bfloat16 *)sinks->buf;
+  float *score_buf = (float *)scores->buf;
+  const size_t batch_size = q->shape[0];
+  const size_t num_kv_heads = q->shape[1];
+  const size_t q_per_kv = q->shape[2];
+  const size_t seq_len = q->shape[3];
+  const size_t head_dim = q->shape[4];
   const size_t rows = q->shape[0] * q->shape[1] * q->shape[2] * q->shape[3];
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(rows, (size_t)block.x));
-  attention_scores_with_sink_kernel<<<grid, block>>>(
-      (const uint16_t *)q->buf, (const uint16_t *)k->buf, sinks->buf, sinks->dtype,
-      (float *)scores->buf, q->shape[0], q->shape[1], q->shape[2], q->shape[3],
-      q->shape[4]);
+  const dim3 grid((unsigned int)ceil_div(rows, (size_t)block.x));
+  attention_scores_with_sink_kernel_bf16xbf16xbf16_to_f32<<<grid, block>>>(
+      q_buf, k_buf, sink_buf, score_buf, batch_size, num_kv_heads, q_per_kv,
+      seq_len, head_dim);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -1024,19 +1053,87 @@ void ScaleMaskSoftmax(Tensor *scores, Tensor *probs, size_t head_dim,
 }
 #endif
 
-void ScaleMaskSoftmax_gpu_f32_to_f32(Tensor *scores, Tensor *probs,
-                                     size_t head_dim, const DeviceTokenBatch *tokens,
-                                     size_t sliding_window) {
+namespace {
+
+__global__ void scale_mask_softmax_kernel(const float *scores,
+                                          const int32_t *lengths, float *probs,
+                                          size_t B, size_t KV, size_t QM,
+                                          size_t T, size_t head_dim,
+                                          size_t sliding_window) {
+  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t rows = B * KV * QM * T;
+  if (row >= rows) {
+    return;
+  }
+
+  const float scale = rsqrtf((float)head_dim);
+  size_t tmp = row;
+  const size_t tq = tmp % T;
+  tmp /= T;
+  tmp /= QM;
+  const size_t b = tmp / KV;
+
+  const size_t valid_t = lengths != nullptr ? (size_t)lengths[b] : T;
+  const size_t row_base = row * (T + 1);
+  for (size_t i = 0; i < T + 1; ++i) {
+    probs[row_base + i] = 0.0f;
+  }
+  if (tq >= valid_t) {
+    return;
+  }
+
+  size_t tk_begin = 0;
+  if (sliding_window > 0 && tq + 1 > sliding_window) {
+    tk_begin = tq + 1 - sliding_window;
+  }
+  const size_t tk_end = min(tq, valid_t - 1);
+
+  float row_max = -1.0e30f;
+  for (size_t tk = tk_begin; tk <= tk_end; ++tk) {
+    row_max = max(row_max, scores[row_base + tk] * scale);
+  }
+  row_max = max(row_max, scores[row_base + T]);
+
+  float sum = 0.0f;
+  for (size_t tk = tk_begin; tk <= tk_end; ++tk) {
+    const float e = expf(scores[row_base + tk] * scale - row_max);
+    probs[row_base + tk] = e;
+    sum += e;
+  }
+  const float sink_exp = expf(scores[row_base + T] - row_max);
+  probs[row_base + T] = sink_exp;
+  sum += sink_exp;
+
+  if (sum > 0.0f) {
+    const float inv_sum = 1.0f / sum;
+    for (size_t tk = tk_begin; tk <= tk_end; ++tk) {
+      probs[row_base + tk] *= inv_sum;
+    }
+    probs[row_base + T] *= inv_sum;
+  }
+}
+
+}  // namespace
+
+void ScaleMaskSoftmax(Tensor *scores, Tensor *probs, size_t head_dim,
+                      const DeviceTokenBatch *tokens, size_t sliding_window) {
   probs->ensure_gpu();
+
+  const float *score_buf = (const float *)scores->buf;
+  const int32_t *length_buf = tokens != nullptr ? tokens->lengths : nullptr;
+  float *prob_buf = (float *)probs->buf;
+  const size_t batch_size = scores->shape[0];
+  const size_t num_kv_heads = scores->shape[1];
+  const size_t q_per_kv = scores->shape[2];
+  const size_t seq_len = scores->shape[3];
   const size_t rows = scores->shape[0] * scores->shape[1] * scores->shape[2] *
                       scores->shape[3];
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(rows, (size_t)block.x));
+  const dim3 grid((unsigned int)ceil_div(rows, (size_t)block.x));
   scale_mask_softmax_kernel<<<grid, block>>>(
-      (const float *)scores->buf, (float *)probs->buf,
-      tokens != nullptr ? tokens->lengths : nullptr, scores->shape[0],
-      scores->shape[1], scores->shape[2], scores->shape[3], head_dim,
-      sliding_window);
+      score_buf, length_buf, prob_buf, batch_size, num_kv_heads, q_per_kv,
+      seq_len, head_dim, sliding_window);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -1073,17 +1170,61 @@ void AttentionContextGrouped(Tensor *probs, Tensor *v, Tensor *context) {
 }
 #endif
 
-void AttentionContextGrouped_gpu_f32xbf16_to_bf16(Tensor *probs, Tensor *v,
-                                                  Tensor *context) {
+namespace {
+
+__global__ void attention_context_grouped_kernel_f32xbf16_to_bf16(
+    const float *probs, const __nv_bfloat16 *v, __nv_bfloat16 *context,
+    size_t B, size_t KV, size_t QM, size_t T, size_t D) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * KV * QM * T * D;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t d = tmp % D;
+  tmp /= D;
+  const size_t tq = tmp % T;
+  tmp /= T;
+  const size_t qm = tmp % QM;
+  tmp /= QM;
+  const size_t kv = tmp % KV;
+  const size_t b = tmp / KV;
+
+  const size_t prob_base = ((((b * KV + kv) * QM + qm) * T + tq) * (T + 1));
+  float sum = 0.0f;
+  for (size_t tk = 0; tk < T; ++tk) {
+    const size_t v_base = (((b * KV + kv) * T + tk) * D);
+    sum = fmaf(probs[prob_base + tk], __bfloat162float(v[v_base + d]), sum);
+  }
+  context[idx] = __float2bfloat16_rn(sum);
+}
+
+}  // namespace
+
+void AttentionContextGrouped(Tensor *probs, Tensor *v, Tensor *context) {
+  CHECK_ERROR(probs->dtype == TensorDType::F32, "AttentionContextGrouped expects F32 probs");
+  CHECK_ERROR(v->dtype == TensorDType::BF16, "AttentionContextGrouped expects BF16 values");
+  CHECK_ERROR(context->dtype == TensorDType::BF16,
+              "AttentionContextGrouped expects BF16 context");
   context->ensure_gpu();
+
+  const float *prob_buf = (const float *)probs->buf;
+  const __nv_bfloat16 *value_buf = (const __nv_bfloat16 *)v->buf;
+  __nv_bfloat16 *context_buf = (__nv_bfloat16 *)context->buf;
+  const size_t batch_size = probs->shape[0];
+  const size_t num_kv_heads = probs->shape[1];
+  const size_t q_per_kv = probs->shape[2];
+  const size_t seq_len = probs->shape[3];
+  const size_t head_dim = v->shape[3];
   const size_t total = probs->shape[0] * probs->shape[1] * probs->shape[2] *
                        probs->shape[3] * v->shape[3];
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  attention_context_grouped_kernel<<<grid, block>>>(
-      (const float *)probs->buf, (const uint16_t *)v->buf, context->buf,
-      context->dtype, probs->shape[0], probs->shape[1], probs->shape[2],
-      probs->shape[3], v->shape[3]);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  attention_context_grouped_kernel_f32xbf16_to_bf16<<<grid, block>>>(
+      prob_buf, value_buf, context_buf, batch_size, num_kv_heads, q_per_kv,
+      seq_len, head_dim);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -1116,16 +1257,55 @@ void MergeHeadsGrouped(Tensor *context, Tensor *merged) {
 }
 #endif
 
-void MergeHeadsGrouped_gpu_bf16_to_bf16(Tensor *context, Tensor *merged) {
+namespace {
+
+__global__ void merge_heads_grouped_kernel_bf16_to_bf16(
+    const __nv_bfloat16 *context, __nv_bfloat16 *merged, size_t B, size_t KV,
+    size_t QM, size_t T, size_t D) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * KV * QM * T * D;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t d = tmp % D;
+  tmp /= D;
+  const size_t t = tmp % T;
+  tmp /= T;
+  const size_t qm = tmp % QM;
+  tmp /= QM;
+  const size_t kv = tmp % KV;
+  const size_t b = tmp / KV;
+
+  const size_t head = kv * QM + qm;
+  const size_t dst = (b * T + t) * (KV * QM * D) + head * D + d;
+  merged[dst] = context[idx];
+}
+
+}  // namespace
+
+void MergeHeadsGrouped(Tensor *context, Tensor *merged) {
+  CHECK_ERROR(context->dtype == TensorDType::BF16, "MergeHeadsGrouped expects BF16 context");
+  CHECK_ERROR(merged->dtype == TensorDType::BF16,
+              "MergeHeadsGrouped expects BF16 merged output");
   merged->ensure_gpu();
+
+  const __nv_bfloat16 *context_buf = (const __nv_bfloat16 *)context->buf;
+  __nv_bfloat16 *merged_buf = (__nv_bfloat16 *)merged->buf;
+  const size_t batch_size = context->shape[0];
+  const size_t num_kv_heads = context->shape[1];
+  const size_t q_per_kv = context->shape[2];
+  const size_t seq_len = context->shape[3];
+  const size_t head_dim = context->shape[4];
   const size_t total = context->shape[0] * context->shape[1] * context->shape[2] *
                        context->shape[3] * context->shape[4];
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  merge_heads_grouped_kernel<<<grid, block>>>(
-      context->buf, context->dtype, merged->buf, merged->dtype,
-      context->shape[0], context->shape[1], context->shape[2], context->shape[3],
-      context->shape[4]);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  merge_heads_grouped_kernel_bf16_to_bf16<<<grid, block>>>(
+      context_buf, merged_buf, batch_size, num_kv_heads, q_per_kv, seq_len,
+      head_dim);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -1143,15 +1323,38 @@ void ResidualAdd(Tensor *input, Tensor *addend, Tensor *output) {
 }
 #endif
 
-void ResidualAdd_gpu_bf16xbf16_to_bf16(Tensor *input, Tensor *addend,
-                                       Tensor *output) {
+namespace {
+
+__global__ void residual_add_kernel_bf16xbf16_to_bf16(
+    const __nv_bfloat16 *input, const __nv_bfloat16 *addend,
+    __nv_bfloat16 *output, size_t n) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+
+  const float lhs = __bfloat162float(input[idx]);
+  const float rhs = __bfloat162float(addend[idx]);
+  output[idx] = __float2bfloat16_rn(lhs + rhs);
+}
+
+}  // namespace
+
+void ResidualAdd(Tensor *input, Tensor *addend, Tensor *output) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "ResidualAdd expects BF16 input");
+  CHECK_ERROR(addend->dtype == TensorDType::BF16, "ResidualAdd expects BF16 addend");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "ResidualAdd expects BF16 output");
   output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  const __nv_bfloat16 *addend_buf = (const __nv_bfloat16 *)addend->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
   const size_t n = input->num_elem();
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(n, (size_t)block.x));
-  residual_add_kernel<<<grid, block>>>(
-      input->buf, input->dtype, addend->buf, addend->dtype, output->buf,
-      output->dtype, n);
+  const dim3 grid((unsigned int)ceil_div(n, (size_t)block.x));
+  residual_add_kernel_bf16xbf16_to_bf16<<<grid, block>>>(
+      input_buf, addend_buf, output_buf, n);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -1175,7 +1378,7 @@ void TopKExperts(Tensor *router_logits, ExpertSelection *selection) {
       for (size_t e = 0; e < E; ++e) {
         float value = row[e];
         if (!std::isfinite(value)) {
-          value = -std::numeric_limits<float>::infinity();
+          value = -1.0e30f;
         }
         values.push_back({value, (int32_t)e});
       }
@@ -1196,23 +1399,263 @@ void TopKExperts(Tensor *router_logits, ExpertSelection *selection) {
         selection->weight(b, t, k) = w;
         sum += w;
       }
+      const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
       for (size_t k = 0; k < selection->K; ++k) {
-        selection->weight(b, t, k) /= sum;
+        selection->weight(b, t, k) *= inv_sum;
       }
     }
   }
 }
 #endif
 
-void TopKExperts_gpu_bf16_to_i32f32(Tensor *router_logits,
-                                    ExpertSelection *selection) {
+namespace {
+
+__global__ void topk_experts_kernel_bf16_to_i32f32(
+    const __nv_bfloat16 *router_logits, int32_t *indices, float *weights,
+    size_t rows, size_t experts, size_t topk) {
+  const size_t row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+
+  constexpr int kMaxTopK = 8;
+  float best_values[kMaxTopK];
+  int32_t best_indices[kMaxTopK];
+  for (size_t i = 0; i < topk; ++i) {
+    best_values[i] = -1.0e30f;
+    best_indices[i] = -1;
+  }
+
+  const size_t base = row * experts;
+  for (size_t e = 0; e < experts; ++e) {
+    float value = __bfloat162float(router_logits[base + e]);
+    if (!isfinite(value)) {
+      value = -1.0e30f;
+    }
+    for (size_t k = 0; k < topk; ++k) {
+      if (value > best_values[k] ||
+          (value == best_values[k] && (int32_t)e < best_indices[k])) {
+        for (size_t shift = topk - 1; shift > k; --shift) {
+          best_values[shift] = best_values[shift - 1];
+          best_indices[shift] = best_indices[shift - 1];
+        }
+        best_values[k] = value;
+        best_indices[k] = (int32_t)e;
+        break;
+      }
+    }
+  }
+
+  float row_max = best_values[0];
+  float sum = 0.0f;
+  for (size_t k = 0; k < topk; ++k) {
+    indices[row * topk + k] = best_indices[k];
+    const float w = expf(best_values[k] - row_max);
+    weights[row * topk + k] = w;
+    sum += w;
+  }
+  const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+  for (size_t k = 0; k < topk; ++k) {
+    weights[row * topk + k] *= inv_sum;
+  }
+}
+
+}  // namespace
+
+void TopKExperts(Tensor *router_logits, ExpertSelection *selection) {
+  CHECK_ERROR(router_logits->dtype == TensorDType::BF16, "TopKExperts expects BF16 router logits");
   selection->ensure_gpu();
+
+  const __nv_bfloat16 *router_buf = (const __nv_bfloat16 *)router_logits->buf;
+  int32_t *index_buf = selection->indices;
+  float *weight_buf = selection->weights;
   const size_t rows = router_logits->shape[0] * router_logits->shape[1];
+  const size_t experts = router_logits->shape[2];
+  const size_t topk = selection->K;
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(rows, (size_t)block.x));
-  topk_experts_kernel<<<grid, block>>>(
-      router_logits->buf, router_logits->dtype, selection->indices,
-      selection->weights, rows, router_logits->shape[2], selection->K);
+  const dim3 grid((unsigned int)ceil_div(rows, (size_t)block.x));
+  topk_experts_kernel_bf16_to_i32f32<<<grid, block>>>(
+      router_buf, index_buf, weight_buf, rows, experts, topk);
+  CUDA_LAUNCH_CHECK();
+}
+
+namespace {
+
+__global__ void expert_gate_up_kernel_bf16xmxfp4xbf16_to_bf16(
+    const __nv_bfloat16 *input, const int32_t *lengths,
+    const int32_t *selection_indices, const Mxfp4PackedByte *blocks,
+    const Mxfp4Scale *scales, const __nv_bfloat16 *bias, __nv_bfloat16 *output,
+    size_t B, size_t T, size_t hidden, size_t K, size_t out_dim,
+    size_t num_experts, size_t groups, size_t bytes_per_block,
+    size_t input_elems, size_t blocks_elems, size_t scales_elems,
+    size_t bias_elems) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * T * K * out_dim;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t row = tmp % out_dim;
+  tmp /= out_dim;
+  const size_t k_idx = tmp % K;
+  tmp /= K;
+  const size_t t = tmp % T;
+  const size_t b = tmp / T;
+
+  if (lengths != nullptr && t >= (size_t)lengths[b]) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+
+  const size_t expert_idx = (size_t)selection_indices[(b * T + t) * K + k_idx];
+  if (expert_idx >= num_experts) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+  const size_t row_offset = expert_idx * out_dim + row;
+  if (row_offset >= bias_elems) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+
+  float sum = __bfloat162float(bias[row_offset]);
+  const size_t values_per_group = bytes_per_block * 2;
+  const size_t input_base = (b * T + t) * hidden;
+  for (size_t g = 0; g < groups; ++g) {
+    const size_t scale_index = row_offset * groups + g;
+    if (scale_index >= scales_elems) {
+      output[idx] = __float2bfloat16_rn(0.0f);
+      return;
+    }
+    const size_t block_offset = scale_index * bytes_per_block;
+    if (block_offset + bytes_per_block > blocks_elems) {
+      output[idx] = __float2bfloat16_rn(0.0f);
+      return;
+    }
+
+    const int exponent = (int)scales[scale_index].biased_exponent - 127;
+    const Mxfp4PackedByte *group_blocks = blocks + block_offset;
+    const size_t base = g * values_per_group;
+    for (size_t i = 0; i < bytes_per_block; ++i) {
+      const size_t lo_index = input_base + base + 2 * i;
+      const size_t hi_index = lo_index + 1;
+      if (hi_index >= input_elems) {
+        output[idx] = __float2bfloat16_rn(0.0f);
+        return;
+      }
+      const uint8_t packed = group_blocks[i].packed;
+      const float lo = ldexpf(fp4_value(packed & 0x0F), exponent);
+      const float hi = ldexpf(fp4_value((packed >> 4) & 0x0F), exponent);
+      sum = fmaf(lo, __bfloat162float(input[lo_index]), sum);
+      sum = fmaf(hi, __bfloat162float(input[hi_index]), sum);
+    }
+  }
+
+  output[idx] = __float2bfloat16_rn(sum);
+}
+
+}  // namespace
+
+#if 0  // Legacy CPU reference retained for kernel-study notes only.
+void ExpertGateUp(Tensor *input, const ExpertSelection *selection,
+                  const QuantizedExpertMatrix &matrix,
+                  const DeviceTokenBatch *tokens, Tensor *output) {
+  CHECK_ERROR(input->ndim == 3 && output->ndim == 4, "ExpertGateUp rank mismatch");
+  CHECK_ERROR(output->shape[0] == input->shape[0] && output->shape[1] == input->shape[1],
+              "ExpertGateUp batch/sequence mismatch");
+  CHECK_ERROR(output->shape[2] == selection->K && output->shape[3] == matrix.out_dim,
+              "ExpertGateUp output shape mismatch");
+  CHECK_ERROR(input->shape[2] == matrix.in_dim, "ExpertGateUp hidden size mismatch");
+
+  const size_t B = input->shape[0];
+  const size_t T = input->shape[1];
+  const size_t hidden = input->shape[2];
+  const size_t K = selection->K;
+  const size_t out_dim = matrix.out_dim;
+  const size_t values_per_group = matrix.bytes_per_block * 2;
+  CHECK_ERROR(matrix.groups * values_per_group == hidden,
+              "ExpertGateUp quantized group layout mismatch");
+
+#pragma omp parallel for collapse(3)
+  for (size_t b = 0; b < B; ++b) {
+    for (size_t t = 0; t < T; ++t) {
+      for (size_t k_idx = 0; k_idx < K; ++k_idx) {
+        float *dst = output->buf + (((b * T + t) * K + k_idx) * out_dim);
+        if (tokens != nullptr && t >= (size_t)tokens->lengths[b]) {
+          memset(dst, 0, out_dim * sizeof(float));
+          continue;
+        }
+
+        const int32_t expert = selection->indices[(b * T + t) * K + k_idx];
+        if (expert < 0 || expert >= (int32_t)matrix.num_experts) {
+          memset(dst, 0, out_dim * sizeof(float));
+          continue;
+        }
+
+        const float *src = input->buf + (b * T + t) * hidden;
+        for (size_t row = 0; row < out_dim; ++row) {
+          const size_t row_offset = (size_t)expert * out_dim + row;
+          float sum = bf16_bits_to_float(matrix.bias[row_offset]);
+          for (size_t g = 0; g < matrix.groups; ++g) {
+            const size_t scale_index = row_offset * matrix.groups + g;
+            const int exponent = (int)matrix.scales[scale_index].biased_exponent - 127;
+            const Mxfp4PackedByte *group_blocks =
+                matrix.blocks + scale_index * matrix.bytes_per_block;
+            const size_t base = g * values_per_group;
+            for (size_t i = 0; i < matrix.bytes_per_block; ++i) {
+              const uint8_t packed = group_blocks[i].packed;
+              sum += ldexpf(fp4_value_host(packed & 0x0F), exponent) * src[base + 2 * i];
+              sum += ldexpf(fp4_value_host((packed >> 4) & 0x0F), exponent) *
+                     src[base + 2 * i + 1];
+            }
+          }
+          dst[row] = sum;
+        }
+      }
+    }
+  }
+  commit_tensor_dtype(output);
+}
+#endif
+
+void ExpertGateUp(Tensor *input, const ExpertSelection *selection,
+                  const QuantizedExpertMatrix &matrix,
+                  const DeviceTokenBatch *tokens, Tensor *output) {
+  CHECK_ERROR(input->ndim == 3 && output->ndim == 4, "ExpertGateUp rank mismatch");
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "ExpertGateUp expects BF16 input");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "ExpertGateUp expects BF16 output");
+  output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  const int32_t *length_buf = tokens != nullptr ? tokens->lengths : nullptr;
+  const int32_t *selection_index_buf = selection->indices;
+  const Mxfp4PackedByte *block_buf = matrix.blocks;
+  const Mxfp4Scale *scale_buf = matrix.scales;
+  const __nv_bfloat16 *bias_buf = (const __nv_bfloat16 *)matrix.bias;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
+  const size_t batch_size = input->shape[0];
+  const size_t seq_len = input->shape[1];
+  const size_t hidden = input->shape[2];
+  const size_t topk = selection->K;
+  const size_t out_dim = matrix.out_dim;
+  const size_t num_experts = matrix.num_experts;
+  const size_t groups = matrix.groups;
+  const size_t bytes_per_block = matrix.bytes_per_block;
+  const size_t input_elems = input->num_elem();
+  const size_t blocks_elems = matrix.blocks_bytes / sizeof(Mxfp4PackedByte);
+  const size_t scales_elems = matrix.scales_bytes / sizeof(Mxfp4Scale);
+  const size_t bias_elems = matrix.bias_bytes / sizeof(uint16_t);
+  const size_t total = batch_size * seq_len * topk * out_dim;
+
+  const dim3 block(kMoeBlockSize);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  expert_gate_up_kernel_bf16xmxfp4xbf16_to_bf16<<<grid, block>>>(
+      input_buf, length_buf, selection_index_buf, block_buf, scale_buf, bias_buf,
+      output_buf, batch_size, seq_len, hidden, topk, out_dim, num_experts,
+      groups, bytes_per_block, input_elems, blocks_elems, scales_elems,
+      bias_elems);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -1246,16 +1689,338 @@ void SwiGLUClamp(Tensor *input, Tensor *output, float limit) {
 }
 #endif
 
-void SwiGLUClamp_gpu_bf16_to_bf16(Tensor *input, Tensor *output, float limit) {
+namespace {
+
+__global__ void swiglu_clamp_kernel_bf16_to_bf16(
+    const __nv_bfloat16 *input, __nv_bfloat16 *output, size_t rows,
+    size_t out_dim, float limit) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = rows * out_dim;
+  if (idx >= total) {
+    return;
+  }
+
+  const size_t row = idx / out_dim;
+  const size_t col = idx % out_dim;
+  const size_t base = row * out_dim * 2 + col * 2;
+  float gate = __bfloat162float(input[base]);
+  float up = __bfloat162float(input[base + 1]);
+  if (gate > limit) {
+    gate = limit;
+  }
+  if (up > limit) {
+    up = limit;
+  } else if (up < -limit) {
+    up = -limit;
+  }
+  const float value =
+      (up + 1.0f) * gate * (1.0f / (1.0f + expf(-1.702f * gate)));
+  output[idx] = __float2bfloat16_rn(value);
+}
+
+}  // namespace
+
+void SwiGLUClamp(Tensor *input, Tensor *output, float limit) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "SwiGLUClamp expects BF16 input");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "SwiGLUClamp expects BF16 output");
   output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
   const size_t rows = flat_rows(output);
   const size_t out_dim = last_dim(output);
   const size_t total = rows * out_dim;
+
   const dim3 block(kBlockSize1D);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
-  swiglu_clamp_kernel<<<grid, block>>>((const uint16_t *)input->buf,
-                                       (uint16_t *)output->buf, rows, out_dim,
-                                       limit);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  swiglu_clamp_kernel_bf16_to_bf16<<<grid, block>>>(
+      input_buf, output_buf, rows, out_dim, limit);
+  CUDA_LAUNCH_CHECK();
+}
+
+namespace {
+
+__global__ void expert_down_kernel_bf16xmxfp4xbf16_to_bf16(
+    const __nv_bfloat16 *input, const int32_t *lengths,
+    const int32_t *selection_indices, const Mxfp4PackedByte *blocks,
+    const Mxfp4Scale *scales, const __nv_bfloat16 *bias, __nv_bfloat16 *output,
+    size_t B, size_t T, size_t K, size_t in_dim, size_t out_dim,
+    size_t num_experts, size_t groups, size_t bytes_per_block,
+    size_t input_elems, size_t blocks_elems, size_t scales_elems,
+    size_t bias_elems) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * T * K * out_dim;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t row = tmp % out_dim;
+  tmp /= out_dim;
+  const size_t k_idx = tmp % K;
+  tmp /= K;
+  const size_t t = tmp % T;
+  const size_t b = tmp / T;
+
+  if (lengths != nullptr && t >= (size_t)lengths[b]) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+
+  const size_t expert_idx = (size_t)selection_indices[(b * T + t) * K + k_idx];
+  if (expert_idx >= num_experts) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+  const size_t row_offset = expert_idx * out_dim + row;
+  if (row_offset >= bias_elems) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+
+  float sum = __bfloat162float(bias[row_offset]);
+  const size_t values_per_group = bytes_per_block * 2;
+  const size_t input_base = ((b * T + t) * K + k_idx) * in_dim;
+  for (size_t g = 0; g < groups; ++g) {
+    const size_t scale_index = row_offset * groups + g;
+    if (scale_index >= scales_elems) {
+      output[idx] = __float2bfloat16_rn(0.0f);
+      return;
+    }
+    const size_t block_offset = scale_index * bytes_per_block;
+    if (block_offset + bytes_per_block > blocks_elems) {
+      output[idx] = __float2bfloat16_rn(0.0f);
+      return;
+    }
+
+    const int exponent = (int)scales[scale_index].biased_exponent - 127;
+    const Mxfp4PackedByte *group_blocks = blocks + block_offset;
+    const size_t base = g * values_per_group;
+    for (size_t i = 0; i < bytes_per_block; ++i) {
+      const size_t lo_index = input_base + base + 2 * i;
+      const size_t hi_index = lo_index + 1;
+      if (hi_index >= input_elems) {
+        output[idx] = __float2bfloat16_rn(0.0f);
+        return;
+      }
+      const uint8_t packed = group_blocks[i].packed;
+      const float lo = ldexpf(fp4_value(packed & 0x0F), exponent);
+      const float hi = ldexpf(fp4_value((packed >> 4) & 0x0F), exponent);
+      sum = fmaf(lo, __bfloat162float(input[lo_index]), sum);
+      sum = fmaf(hi, __bfloat162float(input[hi_index]), sum);
+    }
+  }
+
+  output[idx] = __float2bfloat16_rn(sum);
+}
+
+}  // namespace
+
+#if 0  // Legacy CPU reference retained for kernel-study notes only.
+void ExpertDown(Tensor *input, const ExpertSelection *selection,
+                const QuantizedExpertMatrix &matrix,
+                const DeviceTokenBatch *tokens, Tensor *output) {
+  CHECK_ERROR(input->ndim == 4 && output->ndim == 4, "ExpertDown rank mismatch");
+  CHECK_ERROR(output->shape[0] == input->shape[0] && output->shape[1] == input->shape[1] &&
+                  output->shape[2] == input->shape[2],
+              "ExpertDown batch/sequence/topk mismatch");
+  CHECK_ERROR(output->shape[3] == matrix.out_dim, "ExpertDown output shape mismatch");
+  CHECK_ERROR(input->shape[2] == selection->K, "ExpertDown selection K mismatch");
+  CHECK_ERROR(input->shape[3] == matrix.in_dim, "ExpertDown input dim mismatch");
+
+  const size_t B = input->shape[0];
+  const size_t T = input->shape[1];
+  const size_t K = input->shape[2];
+  const size_t in_dim = input->shape[3];
+  const size_t out_dim = matrix.out_dim;
+  const size_t values_per_group = matrix.bytes_per_block * 2;
+  CHECK_ERROR(matrix.groups * values_per_group == in_dim,
+              "ExpertDown quantized group layout mismatch");
+
+#pragma omp parallel for collapse(3)
+  for (size_t b = 0; b < B; ++b) {
+    for (size_t t = 0; t < T; ++t) {
+      for (size_t k_idx = 0; k_idx < K; ++k_idx) {
+        float *dst = output->buf + (((b * T + t) * K + k_idx) * out_dim);
+        if (tokens != nullptr && t >= (size_t)tokens->lengths[b]) {
+          memset(dst, 0, out_dim * sizeof(float));
+          continue;
+        }
+
+        const int32_t expert = selection->indices[(b * T + t) * K + k_idx];
+        if (expert < 0 || expert >= (int32_t)matrix.num_experts) {
+          memset(dst, 0, out_dim * sizeof(float));
+          continue;
+        }
+
+        const float *src = input->buf + (((b * T + t) * K + k_idx) * in_dim);
+        for (size_t row = 0; row < out_dim; ++row) {
+          const size_t row_offset = (size_t)expert * out_dim + row;
+          float sum = bf16_bits_to_float(matrix.bias[row_offset]);
+          for (size_t g = 0; g < matrix.groups; ++g) {
+            const size_t scale_index = row_offset * matrix.groups + g;
+            const int exponent = (int)matrix.scales[scale_index].biased_exponent - 127;
+            const Mxfp4PackedByte *group_blocks =
+                matrix.blocks + scale_index * matrix.bytes_per_block;
+            const size_t base = g * values_per_group;
+            for (size_t i = 0; i < matrix.bytes_per_block; ++i) {
+              const uint8_t packed = group_blocks[i].packed;
+              sum += ldexpf(fp4_value_host(packed & 0x0F), exponent) * src[base + 2 * i];
+              sum += ldexpf(fp4_value_host((packed >> 4) & 0x0F), exponent) *
+                     src[base + 2 * i + 1];
+            }
+          }
+          dst[row] = sum;
+        }
+      }
+    }
+  }
+  commit_tensor_dtype(output);
+}
+#endif
+
+void ExpertDown(Tensor *input, const ExpertSelection *selection,
+                const QuantizedExpertMatrix &matrix,
+                const DeviceTokenBatch *tokens, Tensor *output) {
+  CHECK_ERROR(input->ndim == 4 && output->ndim == 4, "ExpertDown rank mismatch");
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "ExpertDown expects BF16 input");
+  CHECK_ERROR(output->dtype == TensorDType::BF16, "ExpertDown expects BF16 output");
+  output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  const int32_t *length_buf = tokens != nullptr ? tokens->lengths : nullptr;
+  const int32_t *selection_index_buf = selection->indices;
+  const Mxfp4PackedByte *block_buf = matrix.blocks;
+  const Mxfp4Scale *scale_buf = matrix.scales;
+  const __nv_bfloat16 *bias_buf = (const __nv_bfloat16 *)matrix.bias;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
+  const size_t batch_size = input->shape[0];
+  const size_t seq_len = input->shape[1];
+  const size_t topk = input->shape[2];
+  const size_t in_dim = input->shape[3];
+  const size_t out_dim = matrix.out_dim;
+  const size_t num_experts = matrix.num_experts;
+  const size_t groups = matrix.groups;
+  const size_t bytes_per_block = matrix.bytes_per_block;
+  const size_t input_elems = input->num_elem();
+  const size_t blocks_elems = matrix.blocks_bytes / sizeof(Mxfp4PackedByte);
+  const size_t scales_elems = matrix.scales_bytes / sizeof(Mxfp4Scale);
+  const size_t bias_elems = matrix.bias_bytes / sizeof(uint16_t);
+  const size_t total = batch_size * seq_len * topk * out_dim;
+
+  const dim3 block(kMoeBlockSize);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  expert_down_kernel_bf16xmxfp4xbf16_to_bf16<<<grid, block>>>(
+      input_buf, length_buf, selection_index_buf, block_buf, scale_buf, bias_buf,
+      output_buf, batch_size, seq_len, topk, in_dim, out_dim, num_experts,
+      groups, bytes_per_block, input_elems, blocks_elems, scales_elems,
+      bias_elems);
+  CUDA_LAUNCH_CHECK();
+}
+
+namespace {
+
+__global__ void weighted_expert_reduce_kernel_bf16xf32_to_bf16(
+    const __nv_bfloat16 *expert_outputs, const int32_t *lengths,
+    const float *selection_weights, __nv_bfloat16 *output, size_t B, size_t T,
+    size_t K, size_t hidden) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t total = B * T * hidden;
+  if (idx >= total) {
+    return;
+  }
+
+  size_t tmp = idx;
+  const size_t h = tmp % hidden;
+  tmp /= hidden;
+  const size_t t = tmp % T;
+  const size_t b = tmp / T;
+
+  if (lengths != nullptr && t >= (size_t)lengths[b]) {
+    output[idx] = __float2bfloat16_rn(0.0f);
+    return;
+  }
+
+  float sum = 0.0f;
+  for (size_t k_idx = 0; k_idx < K; ++k_idx) {
+    const float weight = selection_weights[(b * T + t) * K + k_idx];
+    const size_t src = (((b * T + t) * K + k_idx) * hidden) + h;
+    sum = fmaf(weight, __bfloat162float(expert_outputs[src]), sum);
+  }
+
+  output[idx] = __float2bfloat16_rn(sum);
+}
+
+}  // namespace
+
+#if 0  // Legacy CPU reference retained for kernel-study notes only.
+void WeightedExpertReduce(Tensor *expert_outputs,
+                          const ExpertSelection *selection,
+                          const DeviceTokenBatch *tokens, Tensor *output) {
+  CHECK_ERROR(expert_outputs->ndim == 4 && output->ndim == 3,
+              "WeightedExpertReduce rank mismatch");
+  CHECK_ERROR(expert_outputs->shape[0] == output->shape[0] &&
+                  expert_outputs->shape[1] == output->shape[1] &&
+                  expert_outputs->shape[2] == selection->K &&
+                  expert_outputs->shape[3] == output->shape[2],
+              "WeightedExpertReduce shape mismatch");
+
+  const size_t B = output->shape[0];
+  const size_t T = output->shape[1];
+  const size_t K = selection->K;
+  const size_t hidden = output->shape[2];
+
+#pragma omp parallel for collapse(2)
+  for (size_t b = 0; b < B; ++b) {
+    for (size_t t = 0; t < T; ++t) {
+      float *dst = output->buf + (b * T + t) * hidden;
+      if (tokens != nullptr && t >= (size_t)tokens->lengths[b]) {
+        memset(dst, 0, hidden * sizeof(float));
+        continue;
+      }
+
+      memset(dst, 0, hidden * sizeof(float));
+      for (size_t k_idx = 0; k_idx < K; ++k_idx) {
+        const float weight = selection->weights[(b * T + t) * K + k_idx];
+        const float *src =
+            expert_outputs->buf + (((b * T + t) * K + k_idx) * hidden);
+        for (size_t h = 0; h < hidden; ++h) {
+          dst[h] += weight * src[h];
+        }
+      }
+    }
+  }
+  commit_tensor_dtype(output);
+}
+#endif
+
+void WeightedExpertReduce(Tensor *expert_outputs,
+                          const ExpertSelection *selection,
+                          const DeviceTokenBatch *tokens, Tensor *output) {
+  CHECK_ERROR(expert_outputs->ndim == 4 && output->ndim == 3,
+              "WeightedExpertReduce rank mismatch");
+  CHECK_ERROR(expert_outputs->dtype == TensorDType::BF16,
+              "WeightedExpertReduce expects BF16 expert outputs");
+  CHECK_ERROR(output->dtype == TensorDType::BF16,
+              "WeightedExpertReduce expects BF16 output");
+  output->ensure_gpu();
+
+  const __nv_bfloat16 *expert_output_buf =
+      (const __nv_bfloat16 *)expert_outputs->buf;
+  const int32_t *length_buf = tokens != nullptr ? tokens->lengths : nullptr;
+  const float *selection_weight_buf = selection->weights;
+  __nv_bfloat16 *output_buf = (__nv_bfloat16 *)output->buf;
+  const size_t batch_size = output->shape[0];
+  const size_t seq_len = output->shape[1];
+  const size_t topk = selection->K;
+  const size_t hidden = output->shape[2];
+  const size_t total = batch_size * seq_len * hidden;
+
+  const dim3 block(kMoeBlockSize);
+  const dim3 grid((unsigned int)ceil_div(total, (size_t)block.x));
+  weighted_expert_reduce_kernel_bf16xf32_to_bf16<<<grid, block>>>(
+      expert_output_buf, length_buf, selection_weight_buf, output_buf,
+      batch_size, seq_len, topk, hidden);
   CUDA_LAUNCH_CHECK();
 }
 
@@ -1263,21 +2028,71 @@ void SwiGLUClamp_gpu_bf16_to_bf16(Tensor *input, Tensor *output, float limit) {
 void LMHead(Tensor *input, Tensor *weight, Tensor *output) { Linear(input, weight, output); }
 #endif
 
-void Linear_gpu_bf16xbf16_to_f32(Tensor *input, Tensor *weight, Tensor *output) {
+namespace {
+
+__global__ void linear_kernel_bf16xbf16_to_f32(const __nv_bfloat16 *input,
+                                               const __nv_bfloat16 *weight,
+                                               float *output, size_t rows,
+                                               size_t in_dim, size_t out_dim) {
+  const size_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  const size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool valid = row < rows && col < out_dim;
+
+  __shared__ __nv_bfloat16 input_tile[kLinearTileSize][kLinearTileSize];
+  __shared__ __nv_bfloat16 weight_tile[kLinearTileSize][kLinearTileSize];
+
+  float sum = 0.0f;
+  for (size_t k0 = 0; k0 < in_dim; k0 += kLinearTileSize) {
+    const size_t input_col = k0 + threadIdx.x;
+    const size_t weight_row = k0 + threadIdx.y;
+    input_tile[threadIdx.y][threadIdx.x] =
+        (row < rows && input_col < in_dim) ? input[row * in_dim + input_col]
+                                           : __float2bfloat16_rn(0.0f);
+    weight_tile[threadIdx.y][threadIdx.x] =
+        (col < out_dim && weight_row < in_dim)
+            ? weight[col * in_dim + weight_row]
+            : __float2bfloat16_rn(0.0f);
+    __syncthreads();
+
+    for (size_t k = 0; k < kLinearTileSize && (k0 + k) < in_dim; ++k) {
+      sum = fmaf(__bfloat162float(input_tile[threadIdx.y][k]),
+                 __bfloat162float(weight_tile[k][threadIdx.x]), sum);
+    }
+    __syncthreads();
+  }
+  if (valid) {
+    output[row * out_dim + col] = sum;
+  }
+}
+
+}  // namespace
+
+namespace {
+
+void LinearToF32(Tensor *input, Tensor *weight, Tensor *output) {
+  CHECK_ERROR(input->dtype == TensorDType::BF16, "LinearToF32 expects BF16 input");
+  CHECK_ERROR(weight->dtype == TensorDType::BF16, "LinearToF32 expects BF16 weight");
+  CHECK_ERROR(output->dtype == TensorDType::F32, "LinearToF32 expects F32 output");
   weight->ensure_gpu();
   output->ensure_gpu();
+
+  const __nv_bfloat16 *input_buf = (const __nv_bfloat16 *)input->buf;
+  const __nv_bfloat16 *weight_buf = (const __nv_bfloat16 *)weight->buf;
+  float *output_buf = (float *)output->buf;
   const size_t rows = flat_rows(input);
   const size_t in_dim = last_dim(input);
   const size_t out_dim = weight->shape[0];
-  const dim3 block(kLinearBlockCols);
-  const dim3 grid((unsigned int)cuda_common::ceil_div(out_dim, (size_t)block.x),
-                  (unsigned int)rows);
-  linear_kernel<<<grid, block>>>(
-      input->buf, input->dtype, weight->buf, weight->dtype, nullptr, TensorDType::F32,
-      output->buf, output->dtype, rows, in_dim, out_dim, false);
+
+  const dim3 block(kLinearTileSize, kLinearTileSize);
+  const dim3 grid((unsigned int)ceil_div(out_dim, (size_t)block.x),
+                  (unsigned int)ceil_div(rows, (size_t)block.y));
+  linear_kernel_bf16xbf16_to_f32<<<grid, block>>>(
+      input_buf, weight_buf, output_buf, rows, in_dim, out_dim);
   CUDA_LAUNCH_CHECK();
 }
 
-void LMHead_gpu_bf16xbf16_to_f32(Tensor *input, Tensor *weight, Tensor *output) {
-  Linear_gpu_bf16xbf16_to_f32(input, weight, output);
+}  // namespace
+
+void LMHead(Tensor *input, Tensor *weight, Tensor *output) {
+  LinearToF32(input, weight, output);
 }

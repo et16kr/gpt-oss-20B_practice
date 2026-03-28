@@ -42,7 +42,6 @@ QuantizedExpertMatrix::QuantizedExpertMatrix(QuantizedExpertMatrix &&other) noex
   in_dim = other.in_dim;
   groups = other.groups;
   bytes_per_block = other.bytes_per_block;
-  bias_dtype = other.bias_dtype;
   blocks_bytes = other.blocks_bytes;
   scales_bytes = other.scales_bytes;
   bias_bytes = other.bias_bytes;
@@ -75,7 +74,6 @@ QuantizedExpertMatrix &QuantizedExpertMatrix::operator=(QuantizedExpertMatrix &&
   in_dim = other.in_dim;
   groups = other.groups;
   bytes_per_block = other.bytes_per_block;
-  bias_dtype = other.bias_dtype;
   blocks_bytes = other.blocks_bytes;
   scales_bytes = other.scales_bytes;
   bias_bytes = other.bias_bytes;
@@ -229,8 +227,7 @@ QuantizedExpertMatrix ShardedSafetensorsLoader::load_quantized_expert_matrix(
 
   CHECK_ERROR(blocks_info.dtype == "U8", "%s must be U8", blocks_name);
   CHECK_ERROR(scales_info.dtype == "U8", "%s must be U8", scales_name);
-  CHECK_ERROR(bias_info.dtype == "BF16" || bias_info.dtype == "F16" || bias_info.dtype == "F32",
-              "%s must be floating-point", bias_name);
+  CHECK_ERROR(bias_info.dtype == "BF16", "%s must be BF16", bias_name);
   CHECK_ERROR(blocks_info.shape.size() == 4, "%s must be rank 4", blocks_name);
   CHECK_ERROR(scales_info.shape.size() == 3, "%s must be rank 3", scales_name);
   CHECK_ERROR(bias_info.shape.size() == 2, "%s must be rank 2", bias_name);
@@ -253,17 +250,16 @@ QuantizedExpertMatrix ShardedSafetensorsLoader::load_quantized_expert_matrix(
   matrix.in_dim = in_dim;
   matrix.groups = blocks_info.shape[2];
   matrix.bytes_per_block = blocks_info.shape[3];
-  matrix.bias_dtype = tensor_dtype_from_safetensors(bias_info.dtype);
   matrix.blocks_bytes = num_experts * out_dim * matrix.groups * matrix.bytes_per_block;
   matrix.scales_bytes = num_experts * out_dim * matrix.groups;
-  matrix.bias_bytes = num_experts * out_dim * tensor_dtype_size(matrix.bias_dtype);
+  matrix.bias_bytes = num_experts * out_dim * sizeof(uint16_t);
 
   std::vector<uint8_t> host_blocks(matrix.blocks_bytes);
   std::vector<uint8_t> host_scales(matrix.scales_bytes);
-  std::vector<uint8_t> host_bias(matrix.bias_bytes);
+  std::vector<uint16_t> host_bias(num_experts * out_dim);
   read_bytes(*blocks_file, blocks_info, host_blocks.data(), host_blocks.size());
   read_bytes(*scales_file, scales_info, host_scales.data(), host_scales.size());
-  read_bytes(*bias_file, bias_info, host_bias.data(), host_bias.size());
+  read_bytes(*bias_file, bias_info, host_bias.data(), matrix.bias_bytes);
 
   CHECK_CUDA(cudaMalloc((void **)&matrix.blocks, matrix.blocks_bytes));
   CHECK_CUDA(cudaMalloc((void **)&matrix.scales, matrix.scales_bytes));

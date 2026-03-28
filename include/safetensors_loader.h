@@ -14,13 +14,18 @@ struct QuantizedExpertMatrix {
   size_t in_dim = 0;
   size_t groups = 0;
   size_t bytes_per_block = 16;
-  TensorDType bias_dtype = TensorDType::F32;
   size_t blocks_bytes = 0;
   size_t scales_bytes = 0;
   size_t bias_bytes = 0;
-  uint8_t *blocks = nullptr;
-  uint8_t *scales = nullptr;
-  void *bias = nullptr;
+  struct Mxfp4PackedByte {
+    uint8_t packed = 0;
+  };
+  struct Mxfp4Scale {
+    uint8_t biased_exponent = 0;
+  };
+  Mxfp4PackedByte *blocks = nullptr;
+  Mxfp4Scale *scales = nullptr;
+  uint16_t *bias = nullptr;
 
   QuantizedExpertMatrix() = default;
   ~QuantizedExpertMatrix();

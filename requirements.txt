@@ -1,0 +1,8 @@
+accelerate==1.13.0
+kernels==0.12.3
+numpy==2.4.3
+safetensors==0.7.0
+sentencepiece==0.2.1
+tokenizers==0.22.2
+torch==2.10.0
+transformers==4.57.6
