@@ -1,0 +1,2 @@
+RMSNorm과 LayerNorm의 차이를 짧게 설명해줘.
+MoE top-k routing이 계산량을 어떻게 줄이는지 설명해줘.
