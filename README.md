@@ -6,6 +6,24 @@ CUDA 커널 연습용 `gpt-oss-20b` inference 프로젝트입니다.
 - 각 연산은 `*_gpu()` 경계를 가지고 있으며, 현재는 CPU fallback으로 동작합니다.
 - 목표는 학생이 커널을 하나씩 교체해 가며 `gpt-oss-20b` 추론 경로를 직접 완성하는 것입니다.
 
+## 기준 모델
+
+이 프로젝트는 Hugging Face의 `openai/gpt-oss-20b` 모델을 기준으로 구현하고 검증합니다.
+
+- 기준 모델 페이지: `https://huggingface.co/openai/gpt-oss-20b`
+- 기본 checkpoint 경로도 이 모델을 내려받은 `images/gpt-oss-20b/` root 디렉터리를 가정합니다.
+
+## 기대 효과
+
+이 저장소에서 커널을 하나씩 직접 구현해 보면, 현재 `gpt-oss-20b` 같은 최신 open-weight MoE 모델을 실제로 어떻게 추론하는지 구조적으로 이해할 수 있습니다.
+
+- attention 경로를 구현하면서 `GQA`, `YaRN RoPE`, `sink attention`, `sliding/full attention`의 실제 데이터 흐름을 익힐 수 있습니다.
+- MoE 경로를 구현하면서 `router`, `top-k expert selection`, `expert weight 적용`, `weighted reduce`가 어떻게 연결되는지 알 수 있습니다.
+- `BF16`, `MXFP4`, `FP32 accumulation`을 분리해 다루면서 실제 모델 추론에서 dtype 설계가 왜 중요한지 익힐 수 있습니다.
+- sharded safetensors loader를 통해 최신 대형 모델 checkpoint가 어떤 형식으로 저장되고 로드되는지 이해할 수 있습니다.
+- CPU reference와 Hugging Face `transformers` 비교를 통해, 커널 최적화와 별개로 먼저 정답 경로를 맞추는 습관을 훈련할 수 있습니다.
+- `*_gpu_*` 경계별로 구현을 교체해 가며, 큰 모델을 한 번에 다 쓰지 않고 attention, MoE, norm, matmul 같은 단위로 나눠 개발하는 방식을 연습할 수 있습니다.
+
 ## 현재 범위
 
 - root checkpoint `images/gpt-oss-20b/` 지원
