@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -15,7 +16,10 @@
 
 namespace {
 
-constexpr TensorDType kHiddenActivationDType = TensorDType::BF16;
+constexpr TensorDType kResidualActivationDType = TensorDType::F32;
+constexpr TensorDType kAttentionActivationDType = TensorDType::BF16;
+constexpr TensorDType kRouterActivationDType = TensorDType::BF16;
+constexpr TensorDType kMoeIntermediateDType = TensorDType::BF16;
 constexpr TensorDType kAttentionAccumDType = TensorDType::F32;
 constexpr int kMoeBlockSize = 128;
 constexpr int kGenerationBlockSize = 256;
@@ -48,6 +52,7 @@ Parameter *lm_head_weight = nullptr;
 Activation *x = nullptr;
 Activation *residual = nullptr;
 Activation *norm_buf = nullptr;
+Activation *moe_norm_buf = nullptr;
 Activation *q_proj = nullptr;
 Activation *k_proj = nullptr;
 Activation *v_proj = nullptr;
@@ -133,11 +138,13 @@ __device__ inline float fp4_value(uint8_t code) {
   }
 }
 
-__global__ void expert_gate_up_kernel(const uint16_t *input, const int32_t *lengths,
+__global__ void expert_gate_up_kernel(const void *input, TensorDType input_dtype,
+                                      const int32_t *lengths,
                                       const int32_t *selection_indices,
                                       const uint8_t *blocks, const uint8_t *scales,
                                       const void *bias, TensorDType bias_dtype,
-                                      uint16_t *output, size_t B, size_t T,
+                                      void *output, TensorDType output_dtype,
+                                      size_t B, size_t T,
                                       size_t hidden, size_t K, size_t out_dim,
                                       size_t num_experts, size_t groups,
                                       size_t bytes_per_block, size_t input_elems,
@@ -158,18 +165,18 @@ __global__ void expert_gate_up_kernel(const uint16_t *input, const int32_t *leng
   const size_t b = tmp / T;
 
   if (lengths != nullptr && t >= (size_t)lengths[b]) {
-    output[idx] = 0;
+    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
     return;
   }
 
   const size_t expert_idx = (size_t)selection_indices[(b * T + t) * K + k_idx];
   if (expert_idx >= num_experts) {
-    output[idx] = 0;
+    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
     return;
   }
   const size_t row_offset = expert_idx * out_dim + row;
   if (row_offset >= bias_elems) {
-    output[idx] = 0;
+    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
     return;
   }
   float sum = cuda_common::load_tensor_value(bias, bias_dtype, row_offset);
@@ -178,12 +185,12 @@ __global__ void expert_gate_up_kernel(const uint16_t *input, const int32_t *leng
   for (size_t g = 0; g < groups; ++g) {
     const size_t scale_index = row_offset * groups + g;
     if (scale_index >= scales_elems) {
-      output[idx] = 0;
+      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
       return;
     }
     const size_t block_offset = scale_index * bytes_per_block;
     if (block_offset + bytes_per_block > blocks_bytes) {
-      output[idx] = 0;
+      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
       return;
     }
     const int exponent = (int)scales[scale_index] - 127;
@@ -193,24 +200,28 @@ __global__ void expert_gate_up_kernel(const uint16_t *input, const int32_t *leng
       const size_t lo_index = input_base + base + 2 * i;
       const size_t hi_index = lo_index + 1;
       if (hi_index >= input_elems) {
-        output[idx] = 0;
+        cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
         return;
       }
       const uint8_t value = group_blocks[i];
       const float lo = ldexpf(fp4_value(value & 0x0F), exponent);
       const float hi = ldexpf(fp4_value((value >> 4) & 0x0F), exponent);
-      sum += lo * cuda_common::bf16_to_float(input[lo_index]);
-      sum += hi * cuda_common::bf16_to_float(input[hi_index]);
+      sum = fmaf(lo, cuda_common::load_tensor_value(input, input_dtype, lo_index),
+                 sum);
+      sum = fmaf(hi, cuda_common::load_tensor_value(input, input_dtype, hi_index),
+                 sum);
     }
   }
-  output[idx] = cuda_common::float_to_bf16(sum);
+  cuda_common::store_tensor_value(output, output_dtype, idx, sum);
 }
 
-__global__ void expert_down_kernel(const uint16_t *input, const int32_t *lengths,
+__global__ void expert_down_kernel(const void *input, TensorDType input_dtype,
+                                   const int32_t *lengths,
                                    const int32_t *selection_indices,
                                    const uint8_t *blocks, const uint8_t *scales,
                                    const void *bias, TensorDType bias_dtype,
-                                   uint16_t *output, size_t B, size_t T,
+                                   void *output, TensorDType output_dtype,
+                                   size_t B, size_t T,
                                    size_t K, size_t in_dim, size_t out_dim,
                                    size_t num_experts, size_t groups,
                                    size_t bytes_per_block, size_t input_elems,
@@ -231,18 +242,18 @@ __global__ void expert_down_kernel(const uint16_t *input, const int32_t *lengths
   const size_t b = tmp / T;
 
   if (lengths != nullptr && t >= (size_t)lengths[b]) {
-    output[idx] = 0;
+    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
     return;
   }
 
   const size_t expert_idx = (size_t)selection_indices[(b * T + t) * K + k_idx];
   if (expert_idx >= num_experts) {
-    output[idx] = 0;
+    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
     return;
   }
   const size_t row_offset = expert_idx * out_dim + row;
   if (row_offset >= bias_elems) {
-    output[idx] = 0;
+    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
     return;
   }
   float sum = cuda_common::load_tensor_value(bias, bias_dtype, row_offset);
@@ -251,12 +262,12 @@ __global__ void expert_down_kernel(const uint16_t *input, const int32_t *lengths
   for (size_t g = 0; g < groups; ++g) {
     const size_t scale_index = row_offset * groups + g;
     if (scale_index >= scales_elems) {
-      output[idx] = 0;
+      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
       return;
     }
     const size_t block_offset = scale_index * bytes_per_block;
     if (block_offset + bytes_per_block > blocks_bytes) {
-      output[idx] = 0;
+      cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
       return;
     }
     const int exponent = (int)scales[scale_index] - 127;
@@ -266,23 +277,27 @@ __global__ void expert_down_kernel(const uint16_t *input, const int32_t *lengths
       const size_t lo_index = input_base + base + 2 * i;
       const size_t hi_index = lo_index + 1;
       if (hi_index >= input_elems) {
-        output[idx] = 0;
+        cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
         return;
       }
       const uint8_t value = group_blocks[i];
       const float lo = ldexpf(fp4_value(value & 0x0F), exponent);
       const float hi = ldexpf(fp4_value((value >> 4) & 0x0F), exponent);
-      sum += lo * cuda_common::bf16_to_float(input[lo_index]);
-      sum += hi * cuda_common::bf16_to_float(input[hi_index]);
+      sum = fmaf(lo, cuda_common::load_tensor_value(input, input_dtype, lo_index),
+                 sum);
+      sum = fmaf(hi, cuda_common::load_tensor_value(input, input_dtype, hi_index),
+                 sum);
     }
   }
-  output[idx] = cuda_common::float_to_bf16(sum);
+  cuda_common::store_tensor_value(output, output_dtype, idx, sum);
 }
 
-__global__ void weighted_expert_reduce_kernel(const uint16_t *expert_outputs,
+__global__ void weighted_expert_reduce_kernel(const void *expert_outputs,
+                                              TensorDType expert_output_dtype,
                                               const int32_t *lengths,
                                               const float *selection_weights,
-                                              uint16_t *output, size_t B,
+                                              void *output,
+                                              TensorDType output_dtype, size_t B,
                                               size_t T, size_t K,
                                               size_t hidden) {
   const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -298,7 +313,7 @@ __global__ void weighted_expert_reduce_kernel(const uint16_t *expert_outputs,
   const size_t b = tmp / T;
 
   if (lengths != nullptr && t >= (size_t)lengths[b]) {
-    output[idx] = 0;
+    cuda_common::store_tensor_value(output, output_dtype, idx, 0.0f);
     return;
   }
 
@@ -307,9 +322,12 @@ __global__ void weighted_expert_reduce_kernel(const uint16_t *expert_outputs,
     const float weight = selection_weights[(b * T + t) * K + k_idx];
     const size_t src =
         (((b * T + t) * K + k_idx) * hidden) + h;
-    sum += weight * cuda_common::bf16_to_float(expert_outputs[src]);
+    sum = fmaf(weight,
+               cuda_common::load_tensor_value(expert_outputs,
+                                              expert_output_dtype, src),
+               sum);
   }
-  output[idx] = cuda_common::float_to_bf16(sum);
+  cuda_common::store_tensor_value(output, output_dtype, idx, sum);
 }
 
 __global__ void argmax_last_token_kernel(const float *logits, const int32_t *lengths,
@@ -523,10 +541,10 @@ void ExpertGateUp_gpu(Tensor *input, const ExpertSelection *selection,
   const dim3 block(kMoeBlockSize);
   const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
   expert_gate_up_kernel<<<grid, block>>>(
-      (const uint16_t *)input->buf,
+      input->buf, input->dtype,
       current_tokens != nullptr ? current_tokens->lengths : nullptr,
       selection->indices, matrix.blocks, matrix.scales, matrix.bias, matrix.bias_dtype,
-      (uint16_t *)output->buf, input->shape[0], input->shape[1], input->shape[2],
+      output->buf, output->dtype, input->shape[0], input->shape[1], input->shape[2],
       selection->K, matrix.out_dim, matrix.num_experts, matrix.groups,
       matrix.bytes_per_block, input->num_elem(), matrix.blocks_bytes,
       matrix.num_experts * matrix.out_dim * matrix.groups,
@@ -550,10 +568,10 @@ void ExpertDown_gpu(Tensor *input, const ExpertSelection *selection, size_t laye
   const dim3 block(kMoeBlockSize);
   const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
   expert_down_kernel<<<grid, block>>>(
-      (const uint16_t *)input->buf,
+      input->buf, input->dtype,
       current_tokens != nullptr ? current_tokens->lengths : nullptr,
       selection->indices, matrix.blocks, matrix.scales, matrix.bias, matrix.bias_dtype,
-      (uint16_t *)output->buf, input->shape[0], input->shape[1], input->shape[2],
+      output->buf, output->dtype, input->shape[0], input->shape[1], input->shape[2],
       input->shape[3], matrix.out_dim, matrix.num_experts, matrix.groups,
       matrix.bytes_per_block, input->num_elem(), matrix.blocks_bytes,
       matrix.num_experts * matrix.out_dim * matrix.groups,
@@ -576,9 +594,9 @@ void WeightedExpertReduce_gpu(Tensor *expert_outputs, const ExpertSelection *sel
   const dim3 block(kMoeBlockSize);
   const dim3 grid((unsigned int)cuda_common::ceil_div(total, (size_t)block.x));
   weighted_expert_reduce_kernel<<<grid, block>>>(
-      (const uint16_t *)expert_outputs->buf,
+      expert_outputs->buf, expert_outputs->dtype,
       current_tokens != nullptr ? current_tokens->lengths : nullptr,
-      selection->weights, (uint16_t *)output->buf, output->shape[0],
+      selection->weights, output->buf, output->dtype, output->shape[0],
       output->shape[1], selection->K, output->shape[2]);
   CUDA_LAUNCH_CHECK();
 }
@@ -617,12 +635,12 @@ void transformer_block_gpu(size_t layer_idx) {
   ResidualAdd_gpu_bf16xbf16_to_bf16(x, attn_out, residual);
   std::swap(x, residual);
 
-  RMSNorm_gpu_bf16xbf16_to_bf16(x, post_attn_norm_weight[layer_idx], norm_buf,
+  RMSNorm_gpu_bf16xbf16_to_bf16(x, post_attn_norm_weight[layer_idx], moe_norm_buf,
                                 config_.rms_norm_eps);
-  LinearBias_gpu_bf16xbf16xbf16_to_bf16(norm_buf, router_weight[layer_idx],
+  LinearBias_gpu_bf16xbf16xbf16_to_bf16(moe_norm_buf, router_weight[layer_idx],
                                         router_bias[layer_idx], router_logits);
   TopKExperts_gpu_bf16_to_i32f32(router_logits, expert_selection);
-  ExpertGateUp_gpu(norm_buf, expert_selection, layer_idx, gate_up_buf);
+  ExpertGateUp_gpu(moe_norm_buf, expert_selection, layer_idx, gate_up_buf);
   SwiGLUClamp_gpu_bf16_to_bf16(gate_up_buf, gated_buf, config_.swiglu_limit);
   ExpertDown_gpu(gated_buf, expert_selection, layer_idx, expert_out_buf);
   WeightedExpertReduce_gpu(expert_out_buf, expert_selection, moe_out);
@@ -731,21 +749,22 @@ void alloc_activations(size_t batch_size, size_t seq_len) {
   const size_t intermediate = config_.intermediate_size;
   const size_t experts_per_token = config_.experts_per_token;
 
-  x = make_activation({batch_size, seq_len, hidden}, kHiddenActivationDType);
-  residual = make_activation({batch_size, seq_len, hidden}, kHiddenActivationDType);
-  norm_buf = make_activation({batch_size, seq_len, hidden}, kHiddenActivationDType);
-  q_proj = make_activation({batch_size, seq_len, q_hidden}, kHiddenActivationDType);
-  k_proj = make_activation({batch_size, seq_len, kv_hidden}, kHiddenActivationDType);
-  v_proj = make_activation({batch_size, seq_len, kv_hidden}, kHiddenActivationDType);
+  x = make_activation({batch_size, seq_len, hidden}, kResidualActivationDType);
+  residual = make_activation({batch_size, seq_len, hidden}, kResidualActivationDType);
+  norm_buf = make_activation({batch_size, seq_len, hidden}, kResidualActivationDType);
+  moe_norm_buf = make_activation({batch_size, seq_len, hidden}, kAttentionActivationDType);
+  q_proj = make_activation({batch_size, seq_len, q_hidden}, kAttentionActivationDType);
+  k_proj = make_activation({batch_size, seq_len, kv_hidden}, kAttentionActivationDType);
+  v_proj = make_activation({batch_size, seq_len, kv_hidden}, kAttentionActivationDType);
   q = make_activation({batch_size, config_.num_key_value_heads, q_per_kv, seq_len,
                        config_.head_dim},
-                      kHiddenActivationDType);
+                      kAttentionActivationDType);
   k = make_activation(
       {batch_size, config_.num_key_value_heads, seq_len, config_.head_dim},
-      kHiddenActivationDType);
+      kAttentionActivationDType);
   v = make_activation(
       {batch_size, config_.num_key_value_heads, seq_len, config_.head_dim},
-      kHiddenActivationDType);
+      kAttentionActivationDType);
   att_scores = make_activation(
       {batch_size, config_.num_key_value_heads, q_per_kv, seq_len, seq_len + 1},
       kAttentionAccumDType);
@@ -754,23 +773,23 @@ void alloc_activations(size_t batch_size, size_t seq_len) {
       kAttentionAccumDType);
   context = make_activation({batch_size, config_.num_key_value_heads, q_per_kv, seq_len,
                              config_.head_dim},
-                            kHiddenActivationDType);
-  merged = make_activation({batch_size, seq_len, q_hidden}, kHiddenActivationDType);
-  attn_out = make_activation({batch_size, seq_len, hidden}, kHiddenActivationDType);
+                            kAttentionActivationDType);
+  merged = make_activation({batch_size, seq_len, q_hidden}, kAttentionActivationDType);
+  attn_out = make_activation({batch_size, seq_len, hidden}, kResidualActivationDType);
   router_logits =
       make_activation({batch_size, seq_len, config_.num_local_experts},
-                      kHiddenActivationDType);
+                      kRouterActivationDType);
   gate_up_buf = make_activation(
       {batch_size, seq_len, experts_per_token, intermediate * 2},
-      kHiddenActivationDType);
+      kMoeIntermediateDType);
   gated_buf = make_activation(
       {batch_size, seq_len, experts_per_token, intermediate},
-      kHiddenActivationDType);
+      kMoeIntermediateDType);
   expert_out_buf = make_activation(
       {batch_size, seq_len, experts_per_token, hidden},
-      kHiddenActivationDType);
-  moe_out = make_activation({batch_size, seq_len, hidden}, kHiddenActivationDType);
-  final_norm = make_activation({batch_size, seq_len, hidden}, kHiddenActivationDType);
+      kMoeIntermediateDType);
+  moe_out = make_activation({batch_size, seq_len, hidden}, kResidualActivationDType);
+  final_norm = make_activation({batch_size, seq_len, hidden}, kResidualActivationDType);
   expert_selection = new ExpertSelection(batch_size, seq_len, experts_per_token);
 }
 
@@ -809,6 +828,7 @@ void free_activations() {
   delete_tensor(x);
   delete_tensor(residual);
   delete_tensor(norm_buf);
+  delete_tensor(moe_norm_buf);
   delete_tensor(q_proj);
   delete_tensor(k_proj);
   delete_tensor(v_proj);
